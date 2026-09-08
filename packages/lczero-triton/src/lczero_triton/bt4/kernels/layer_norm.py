@@ -25,13 +25,33 @@ _ACTIVATIONS: dict[Activation, int] = {
 }
 _MISH_BRANCH = tl.constexpr(-0.6)
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
-_WARP_COUNTS = (1, 2, 4, 8, 16)
-
+_WARP_COUNTS = (
+    (1, 0),
+    (2, 0),
+    (4, 0),
+    (8, 0),
+    (16, 0),
+    (1, 1),
+    (2, 1),
+    (4, 1),
+    (8, 1),
+    (16, 1),
+)
 
 def _layer_norm_configs() -> list[triton.Config]:
     """Return independent warp-count candidates for one normalized row."""
-    return [triton.Config({}, num_warps=num_warps) for num_warps in _WARP_COUNTS]
+    return [triton.Config({"online_algorithm": online}, num_warps=num_warps)
+            for num_warps, online in _WARP_COUNTS]
 
+
+@triton.jit
+def welford_combine(mean_a, m2_a, weight_a, mean_b, m2_b, weight_b):
+    delta = mean_b - mean_a
+    total_weight = weight_a + weight_b
+    weight_b_share = tl.where(total_weight == 0.0, 0.0, weight_b / total_weight)
+    new_mean = mean_a + delta * weight_b_share
+    new_m2 = m2_a + m2_b + delta * delta * (weight_a * weight_b_share)
+    return new_mean, new_m2, total_weight
 
 @triton.jit
 def _layer_norm_row(
@@ -48,6 +68,7 @@ def _layer_norm_row(
     activation: tl.constexpr,
     has_skip: tl.constexpr,
     block_size: tl.constexpr,
+    online_algorithm: tl.constexpr
 ) -> None:
     row = tl.program_id(0)
     offsets = tl.arange(0, block_size)
@@ -75,11 +96,26 @@ def _layer_norm_row(
         skip_values = tl.load(skip + pointers, mask=valid, other=0.0).to(tl.float32)
         values = alpha_value * values + skip_values
 
-    values = tl.where(valid, values, 0.0)
-    mean = tl.sum(values, axis=0) / width
-    centered = tl.where(valid, values - mean, 0.0)
-    variance = tl.sum(centered * centered, axis=0) / width
-    normalized = centered / tl.sqrt(variance + epsilon)
+    inverse_width = 1.0 / width
+
+    if online_algorithm:
+        mean = values
+        m2 = tl.zeros_like(values)
+        weight = tl.where(valid, 1.0, 0.0)
+
+        mean, m2, weight = tl.reduce((mean, m2, weight), axis=0, combine_fn=welford_combine)
+
+        variance = m2 * inverse_width
+        variance = tl.maximum(variance, 0.0)
+        centered = values - mean
+    else:
+        values = tl.where(valid, values, 0.0)
+        mean = tl.sum(values, axis=0) * inverse_width
+        centered = tl.where(valid, values - mean, 0.0)
+        variance = tl.sum(centered * centered, axis=0)  * inverse_width
+
+    inverse_stddev = 1.0 / tl.sqrt(variance + epsilon)
+    normalized = centered * inverse_stddev
 
     gamma_values = tl.load(gammas + offsets, mask=valid, other=0.0).to(tl.float32)
     beta_values = tl.load(betas + offsets, mask=valid, other=0.0).to(tl.float32)
@@ -104,6 +140,7 @@ def _layer_norm_kernel(
     epsilon: tl.constexpr,
     activation: tl.constexpr,
     block_size: tl.constexpr,
+    online_algorithm: tl.constexpr,
 ) -> None:
     """Normalize rows without a residual connection or runtime alpha."""
     _layer_norm_row(
@@ -120,6 +157,7 @@ def _layer_norm_kernel(
         activation,
         0,
         block_size,
+        online_algorithm,
     )
 
 
@@ -142,6 +180,7 @@ def _layer_norm_skip_kernel(
     epsilon: tl.constexpr,
     activation: tl.constexpr,
     block_size: tl.constexpr,
+    online_algorithm: tl.constexpr,
 ) -> None:
     """Normalize rows after alpha scaling and a residual connection."""
     _layer_norm_row(
@@ -158,6 +197,7 @@ def _layer_norm_skip_kernel(
         activation,
         1,
         block_size,
+        online_algorithm,
     )
 
 

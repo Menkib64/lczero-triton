@@ -1,4 +1,4 @@
 [submodule "lc0"]
 	path = submodules/lc0
-	url = git@flatty.mooskagh.com:lc0
+	url = https://github.com/mooskagh/lc0.git
 	branch = master

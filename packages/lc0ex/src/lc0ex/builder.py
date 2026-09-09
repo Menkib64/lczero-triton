@@ -6,7 +6,13 @@ from os import PathLike
 from pathlib import Path
 from typing import Self
 
-from lc0ex.buffer_builder import AllocationPlan, Buffer, BufferBuilder
+from lc0ex.buffer_builder import (
+    AllocationPlan,
+    Buffer,
+    BufferBuilder,
+    BufferLocation,
+    data_type_size_bytes,
+)
 from lc0ex.kernel_builder import (
     KernelArtifact,
     KernelHandle,
@@ -393,8 +399,8 @@ class ExecutableBuilder:
         program: ProgramBuilder,
     ) -> tuple[list[list[int]], dict[Buffer, set[Buffer]]]:
         """Return reduced dependencies and reusable-buffer conflicts."""
-        latest_writer: dict[Buffer, int] = {}
-        readers: dict[Buffer, set[int]] = {}
+        writes: list[tuple[Buffer, int, int, int]] = []
+        reads: list[tuple[Buffer, int, int, int]] = []
         ancestors: list[int] = []
         accesses: dict[Buffer, set[int]] = {}
 
@@ -405,13 +411,15 @@ class ExecutableBuilder:
                 for argument in invocation.arguments
                 if isinstance(argument, Buffer)
             }:
+                # Views share their root's storage, so the reuse planner must see
+                # every access to any view as an access to the root.
                 if self._buffers.is_reusable(buffer):
-                    accesses.setdefault(buffer, set()).add(index)
+                    accesses.setdefault(buffer.root_storage, set()).add(index)
             reduced_dependencies, ancestor_mask = self._invocation_dependencies(
                 invocation,
                 index,
-                latest_writer,
-                readers,
+                writes,
+                reads,
                 ancestors,
             )
             ancestors.append(ancestor_mask)
@@ -472,7 +480,15 @@ class ExecutableBuilder:
             )
             for argument in invocation.arguments:
                 if isinstance(argument, Buffer):
-                    location = locations[argument]
+                    # A view is not in the plan: its address is its root's
+                    # planned offset plus its own byte offset.
+                    location = locations.get(argument)
+                    if location is None:
+                        root_location = locations[argument.root_storage]
+                        location = BufferLocation(
+                            root_location.allocation,
+                            root_location.offset + argument.offset,
+                        )
                     allocation_kind = (
                         lc0ex_pb2.Node.Argument.AllocationLocation.AllocationKind
                     )
@@ -496,12 +512,35 @@ class ExecutableBuilder:
                         )
                     )
 
+    def _hazard_range(self, buffer: Buffer) -> tuple[Buffer, int, int]:
+        """Return the (root storage, first byte, last byte + 1) a buffer touches.
+
+        A root buffer covers its whole allocation record.  A view covers the
+        bounding box of its strided extent, which over-approximates a strided
+        view and is exact for a contiguous one; over-approximation only ever adds
+        an edge, never drops one.
+        """
+        root = buffer.root_storage
+        size = self._buffers.storage_size_bytes(buffer)
+        if buffer is root:
+            return (root, 0, size)
+        shape, strides = buffer.shape, buffer.strides
+        if not shape:
+            return (root, 0, size)
+        element = data_type_size_bytes(buffer.dtype) if buffer.dtype else 1
+        span = element
+        for extent, stride in zip(shape, strides, strict=True):
+            if extent > 0:
+                span += (extent - 1) * abs(stride) * element
+        low = buffer.offset
+        return (root, low, min(low + span, size) if size else low + span)
+
     def _invocation_dependencies(
         self,
         invocation: _KernelInvocation,
         index: int,
-        latest_writer: dict[Buffer, int],
-        readers: dict[Buffer, set[int]],
+        writes: list[tuple[Buffer, int, int, int]],
+        reads: list[tuple[Buffer, int, int, int]],
         ancestors: list[int],
     ) -> tuple[list[int], int]:
         """Update access hazards and return reduced dependencies for one node."""
@@ -511,19 +550,23 @@ class ExecutableBuilder:
             for argument in invocation.arguments
             if isinstance(argument, Buffer)
         }:
+            root, low, high = self._hazard_range(buffer)
+            # read-after-write, for a reader and a writer alike
+            dependencies.update(
+                entry[3]
+                for entry in writes
+                if entry[0] is root and entry[1] < high and low < entry[2]
+            )
             if buffer in invocation.readonly:
-                writer = latest_writer.get(buffer)
-                if writer is not None:
-                    dependencies.add(writer)
-                readers.setdefault(buffer, set()).add(index)
+                reads.append((root, low, high, index))
                 continue
-
-            writer = latest_writer.get(buffer)
-            if writer is not None:
-                dependencies.add(writer)
-            dependencies.update(readers.get(buffer, set()))
-            latest_writer[buffer] = index
-            readers[buffer] = set()
+            # write-after-read
+            dependencies.update(
+                entry[3]
+                for entry in reads
+                if entry[0] is root and entry[1] < high and low < entry[2]
+            )
+            writes.append((root, low, high, index))
 
         reduced_dependencies: list[int] = []
         covered_ancestors = 0

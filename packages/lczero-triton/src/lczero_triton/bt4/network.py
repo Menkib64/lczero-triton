@@ -1,6 +1,7 @@
 """Protobuf-driven grammar for construction of the BT4 executable graph."""
 
 import logging
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -21,6 +22,10 @@ from lczero_triton.bt4.kernels.add_vectors import (
 from lczero_triton.bt4.kernels.batched_matmul import (
     BatchedMatmulSpecialization,
     batched_matmul,
+)
+from lczero_triton.bt4.kernels.cutlass_matmul import (
+    CutlassMatmulSpecialization,
+    cutlass_matmul,
 )
 from lczero_triton.bt4.kernels.expand_planes import (
     ExpandPlanesSpecialization,
@@ -60,8 +65,61 @@ from lczero_triton.bt4.kernels.promotion_logits import (
 _F16_SIZE_BYTES = 2
 _INPUT_CHANNELS = 112
 _POSITION_CHANNELS = 12
+
+# Opt-in per GEMM: build the encoder FFN and out-projection from CUTLASS rather
+# than Triton. Each is a separate arm because the arms do not add (R7), and each
+# must gate bit-identical against the Triton kernel it replaces before it counts.
+_CUTLASS_FFN1 = os.environ.get("LC0EX_CUTLASS_FFN1") == "1"
+_CUTLASS_FFN2 = os.environ.get("LC0EX_CUTLASS_FFN2") == "1"
+_CUTLASS_OUTPROJ = os.environ.get("LC0EX_CUTLASS_OUTPROJ") == "1"
+_CUTLASS_QKV = os.environ.get("LC0EX_CUTLASS_QKV") == "1"
+
+# Chunked attention segment (round 14 item A.2).  `LC0EX_SEGMENT_CHUNK` is the
+# chunk size in SAMPLES; 0 or unset leaves the segment whole and this file emits
+# exactly what it emitted before.  `LC0EX_CHUNK_MODE` selects how the chunks may
+# overlap: `chain` (one reused buffer set, sequential), `free` (a set per chunk,
+# the graph overlaps them) or `rotate2` (two sets, i overlaps i+1 but not i+2).
+_SEGMENT_CHUNK = os.environ.get("LC0EX_SEGMENT_CHUNK", "")
+_CHUNK_MODE = os.environ.get("LC0EX_CHUNK_MODE", "chain")
+# The layer norm is a streaming kernel with no residency to win, and splitting it
+# measured +45 % on its own time, so by default it stays whole and only the
+# segment ahead of it is chunked.  `chunked` restores the split for an A/B.
+_CHUNK_LN_WHOLE = os.environ.get("LC0EX_CHUNK_LN", "whole") != "chunked"
+_MIN_SEGMENT_CHUNK = 16
+
 _SQUARE_COUNT = 64
 _LOGGER = logging.getLogger(__name__)
+
+
+def _segment_chunk(batch_size: int) -> int:
+    """Return the segment chunk size in samples, or 0 when it is not chunked.
+
+    A chunk must divide the batch and be smaller than it; anything else silently
+    means "no chunking" rather than an artifact that is subtly not the rung it
+    claims to be.
+    """
+    if not _SEGMENT_CHUNK:
+        return 0
+    target = int(_SEGMENT_CHUNK)
+    if target <= 0 or target >= batch_size:
+        return 0
+    # Snap DOWN to a divisor of the rung rather than giving up on it: at the
+    # two-slot target of 32 the deploy ladder's 40, 48 and 56 would otherwise
+    # stay whole, and 48 is where the two-slot throughput peaks.  The floor is
+    # 16 -- c = 16 measured -4.2 % at one slot, so smaller chunks never pay.
+    for chunk in range(target, _MIN_SEGMENT_CHUNK - 1, -1):
+        if batch_size % chunk == 0:
+            return chunk
+    return 0
+
+
+def _chunk_set_count(mode: str, chunk_count: int) -> int:
+    """Return how many independent per-chunk buffer sets a mode allocates."""
+    if mode == "chain":
+        return 1
+    if mode == "rotate2":
+        return min(2, chunk_count)
+    return chunk_count
 
 
 @dataclass(slots=True)
@@ -649,9 +707,20 @@ def _encoder_tower(
             encoder,
             prefix=f"/encoder{index}",
             head_count=weights.headcount,
-            shared_smolgen=weights.smolgen_w,
+            shared_smolgen=weights.smolgen_w if _has_smolgen(weights) else None,
         )
     return body
+
+
+def _has_smolgen(weights: net_pb2.Weights) -> bool:
+    """Report whether this network carries smolgen at all.
+
+    BT5-rpe has none: `mha.smolgen` is absent and the shared `smolgen_w` is
+    empty, and the three RPE tables take its place. The shared projection is
+    what decides -- a per-layer `smolgen` block without it could not be
+    projected to 64x64 logits.
+    """
+    return weights.HasField("smolgen_w") and bool(weights.smolgen_w.params)
 
 
 def _encoder(  # noqa: PLR0913
@@ -662,17 +731,20 @@ def _encoder(  # noqa: PLR0913
     *,
     prefix: str,
     head_count: int,
-    shared_smolgen: net_pb2.Weights.Layer,
+    shared_smolgen: net_pb2.Weights.Layer | None,
 ) -> Buffer:
-    """Build one Smolgen attention and FFN encoder residual block."""
-    smolgen, generated_width = _smolgen(
-        context,
-        body,
-        body_width,
-        encoder,
-        prefix=prefix,
-        head_count=head_count,
-    )
+    """Build one attention and FFN encoder residual block, smolgen optional."""
+    if shared_smolgen is None:
+        smolgen, generated_width = None, 0
+    else:
+        smolgen, generated_width = _smolgen(
+            context,
+            body,
+            body_width,
+            encoder,
+            prefix=prefix,
+            head_count=head_count,
+        )
     attended = _attention(
         context,
         body,
@@ -844,25 +916,27 @@ def _smolgen(  # noqa: PLR0913
 def _attention(  # noqa: PLR0913
     context: _BuildContext,
     body: Buffer,
-    smolgen: Buffer,
+    smolgen: Buffer | None,
     body_width: int,
     encoder: net_pb2.Weights.EncoderLayer,
     *,
     prefix: str,
     head_count: int,
-    shared_smolgen: net_pb2.Weights.Layer,
+    shared_smolgen: net_pb2.Weights.Layer | None,
     generated_width: int,
 ) -> Buffer:
-    """Build shared Smolgen projection and the encoder Q/K/V attention path."""
+    """Build the encoder Q/K/V attention path, with smolgen if the net has it."""
     mha = encoder.mha
     path = f"weights.{prefix[1:]}"
-    shared_weights, _ = _matrix_f16(
-        context,
-        shared_smolgen,
-        input_width=generated_width,
-        name="/const/smolgen_w",
-        path="weights.smolgen_w",
-    )
+    has_smolgen = shared_smolgen is not None and smolgen is not None
+    if has_smolgen:
+        shared_weights, _ = _matrix_f16(
+            context,
+            shared_smolgen,
+            input_width=generated_width,
+            name="/const/smolgen_w",
+            path="weights.smolgen_w",
+        )
     expected_smolgen_width = _SQUARE_COUNT * _SQUARE_COUNT
 
     element_count = len(mha.q_w.params) // _F16_SIZE_BYTES
@@ -942,96 +1016,244 @@ def _attention(  # noqa: PLR0913
 
     token_rows = context.batch_size * _SQUARE_COUNT
     attention_batches = context.batch_size * head_count
-    smolgen_logits = _temporary_f16(
-        context, element_count=attention_batches * expected_smolgen_width
-    )
-    matmul(
-        context.builder,
-        context.kernels,
-        smolgen_logits,
-        smolgen,
-        shared_weights,
-        MatmulSpecialization(
-            attention_batches,
-            expected_smolgen_width,
-            generated_width,
-            context.architecture,
-        ),
-    )
-    qkv_activations = _temporary_f16(
-        context, element_count=token_rows * (3 * model_width)
-    )
-    matmul(
-        context.builder,
-        context.kernels,
-        qkv_activations,
-        body,
-        qkv_weights,
-        MatmulSpecialization(
-            token_rows,
-            3 * model_width,
-            body_width,
-            context.architecture,
-            has_bias=True,
-            activation="none",
-        ),
-        bias=qkv_bias,
-    )
-    merged = _temporary_f16(context, element_count=token_rows * model_width)
-    fused_attention(
-        context.builder,
-        context.kernels,
-        merged,
-        qkv_activations,
-        smolgen_logits,
-        scale,
-        FusedAttentionSpecialization(
-            batch_count=attention_batches,
-            model_width=model_width,
-            head_depth=head_depth,
-            heads_per_sample=head_count,
-            architecture=context.architecture,
-        ),
-    )
-    branch = _temporary_f16(context, element_count=token_rows * body_width)
-    matmul(
-        context.builder,
-        context.kernels,
-        branch,
-        merged,
-        output_weights,
-        MatmulSpecialization(
-            token_rows,
-            body_width,
-            model_width,
-            context.architecture,
-            has_bias=True,
-            has_skip=True,
-        ),
-        bias=output_bias,
-        skip=body,
-        alpha=alpha,
+    chunk = _segment_chunk(context.batch_size)
+    chunk_count = context.batch_size // chunk if chunk else 1
+    chunk_rows = token_rows // chunk_count
+    chunk_batches = attention_batches // chunk_count
+    set_count = _chunk_set_count(_CHUNK_MODE, chunk_count)
+    if chunk:
+        _LOGGER.info(
+            "batch size %d: segment chunked c=%d (%d chunks, mode %s, %d sets)",
+            context.batch_size,
+            chunk,
+            chunk_count,
+            _CHUNK_MODE,
+            set_count,
+        )
+
+    # One set of scratch buffers per concurrency slot, allocated in the same
+    # order as the unchunked builder so that with chunking off the packing plan,
+    # and therefore the artifact, is byte-for-byte what it was.  `chain`
+    # allocates one set and reuses it, which is what serializes the chunks;
+    # `free` allocates one per chunk, which is what lets the graph overlap them.
+    scratch = [
+        (
+            (
+                _temporary_f16(
+                    context, element_count=chunk_batches * expected_smolgen_width
+                )
+                if has_smolgen
+                else None
+            ),
+            _temporary_f16(context, element_count=chunk_rows * (3 * model_width)),
+            _temporary_f16(context, element_count=chunk_rows * model_width),
+            (
+                None
+                if _CHUNK_LN_WHOLE
+                else _temporary_f16(context, element_count=chunk_rows * body_width)
+            ),
+        )
+        for _ in range(set_count)
+    ]
+    # Whole when the norm is whole: the out-projection writes it by row range and
+    # the norm reads it once, so it never has to be a per-chunk buffer.
+    whole_branch = (
+        _temporary_f16(context, element_count=token_rows * body_width)
+        if _CHUNK_LN_WHOLE
+        else None
     )
     attended = _temporary_f16(context, element_count=token_rows * body_width)
-    layer_norm(
-        context.builder,
-        context.kernels,
-        attended,
-        branch,
-        None,
-        gammas,
-        betas,
-        LayerNormSpecialization(
-            row_count=token_rows,
-            width=body_width,
-            activation="none",
-            has_skip=False,
-            has_bias=False,
-            architecture=context.architecture,
-        ),
-    )
-    return attended
+    if not chunk:
+        # Unchunked: one chunk over the whole batch, no views anywhere, so the
+        # emitted graph is identical to the pre-chunking builder's.
+        body_chunks = [body]
+        smolgen_chunks = [smolgen]
+        attended_chunks = [attended]
+        branch_chunks = [whole_branch]
+    else:
+        body_view = body.as_tensor(
+            (token_rows, body_width), lc0ex_pb2.Buffer.DATA_TYPE_F16
+        )
+        attended_view = attended.as_tensor(
+            (token_rows, body_width), lc0ex_pb2.Buffer.DATA_TYPE_F16
+        )
+        body_chunks = [
+            body_view[index * chunk_rows : (index + 1) * chunk_rows, :]
+            for index in range(chunk_count)
+        ]
+        attended_chunks = [
+            attended_view[index * chunk_rows : (index + 1) * chunk_rows, :]
+            for index in range(chunk_count)
+        ]
+        if _CHUNK_LN_WHOLE:
+            branch_view = whole_branch.as_tensor(
+                (token_rows, body_width), lc0ex_pb2.Buffer.DATA_TYPE_F16
+            )
+            branch_chunks = [
+                branch_view[index * chunk_rows : (index + 1) * chunk_rows, :]
+                for index in range(chunk_count)
+            ]
+        else:
+            branch_chunks = [None] * chunk_count
+        if has_smolgen:
+            smolgen_view = smolgen.as_tensor(
+                (attention_batches, generated_width),
+                lc0ex_pb2.Buffer.DATA_TYPE_F16,
+            )
+            smolgen_chunks = [
+                smolgen_view[
+                    index * chunk_batches : (index + 1) * chunk_batches, :
+                ]
+                for index in range(chunk_count)
+            ]
+        else:
+            smolgen_chunks = [None] * chunk_count
 
+    for index in range(chunk_count):
+        smolgen_logits, qkv_activations, merged, scratch_branch = scratch[
+            index % set_count
+        ]
+        branch = branch_chunks[index] if _CHUNK_LN_WHOLE else scratch_branch
+        body_chunk = body_chunks[index]
+        if has_smolgen:
+            matmul(
+                context.builder,
+                context.kernels,
+                smolgen_logits,
+                smolgen_chunks[index],
+                shared_weights,
+                MatmulSpecialization(
+                    chunk_batches,
+                    expected_smolgen_width,
+                    generated_width,
+                    context.architecture,
+                ),
+            )
+        if _CUTLASS_QKV:
+            cutlass_matmul(
+                context.builder,
+                context.kernels,
+                qkv_activations,
+                body_chunk,
+                qkv_weights,
+                CutlassMatmulSpecialization(
+                    chunk_rows,
+                    3 * model_width,
+                    body_width,
+                    context.architecture,
+                    has_bias=True,
+                    activation="none",
+                ),
+                bias=qkv_bias,
+            )
+        else:
+            matmul(
+                context.builder,
+                context.kernels,
+                qkv_activations,
+                body_chunk,
+                qkv_weights,
+                MatmulSpecialization(
+                    chunk_rows,
+                    3 * model_width,
+                    body_width,
+                    context.architecture,
+                    has_bias=True,
+                    activation="none",
+                ),
+                bias=qkv_bias,
+            )
+        fused_attention(
+            context.builder,
+            context.kernels,
+            merged,
+            qkv_activations,
+            smolgen_logits,
+            scale,
+            FusedAttentionSpecialization(
+                batch_count=chunk_batches,
+                model_width=model_width,
+                head_depth=head_depth,
+                heads_per_sample=head_count,
+                architecture=context.architecture,
+                has_smolgen=has_smolgen,
+            ),
+        )
+        if _CUTLASS_OUTPROJ:
+            cutlass_matmul(
+                context.builder,
+                context.kernels,
+                branch,
+                merged,
+                output_weights,
+                CutlassMatmulSpecialization(
+                    chunk_rows,
+                    body_width,
+                    model_width,
+                    context.architecture,
+                    has_bias=True,
+                    has_skip=True,
+                ),
+                bias=output_bias,
+                skip=body_chunk,
+                alpha=alpha,
+            )
+        else:
+            matmul(
+                context.builder,
+                context.kernels,
+                branch,
+                merged,
+                output_weights,
+                MatmulSpecialization(
+                    chunk_rows,
+                    body_width,
+                    model_width,
+                    context.architecture,
+                    has_bias=True,
+                    has_skip=True,
+                ),
+                bias=output_bias,
+                skip=body_chunk,
+                alpha=alpha,
+            )
+        if not _CHUNK_LN_WHOLE:
+            layer_norm(
+                context.builder,
+                context.kernels,
+                attended_chunks[index],
+                branch,
+                None,
+                gammas,
+                betas,
+                LayerNormSpecialization(
+                    row_count=chunk_rows,
+                    width=body_width,
+                    activation="none",
+                    has_skip=False,
+                    has_bias=False,
+                    architecture=context.architecture,
+                ),
+            )
+    if _CHUNK_LN_WHOLE:
+        layer_norm(
+            context.builder,
+            context.kernels,
+            attended,
+            whole_branch,
+            None,
+            gammas,
+            betas,
+            LayerNormSpecialization(
+                row_count=token_rows,
+                width=body_width,
+                activation="none",
+                has_skip=False,
+                has_bias=False,
+                architecture=context.architecture,
+            ),
+        )
+    return attended
 
 def _ffn(
     context: _BuildContext,
@@ -1090,41 +1312,79 @@ def _ffn(
 
     token_rows = context.batch_size * _SQUARE_COUNT
     hidden = _temporary_f16(context, element_count=token_rows * hidden_width)
-    matmul(
-        context.builder,
-        context.kernels,
-        hidden,
-        body,
-        dense1_weights,
-        MatmulSpecialization(
-            token_rows,
-            hidden_width,
-            body_width,
-            context.architecture,
-            has_bias=True,
-            activation="mish",
-        ),
-        bias=dense1_bias,
-    )
+    if _CUTLASS_FFN1:
+        cutlass_matmul(
+            context.builder,
+            context.kernels,
+            hidden,
+            body,
+            dense1_weights,
+            CutlassMatmulSpecialization(
+                token_rows,
+                hidden_width,
+                body_width,
+                context.architecture,
+                has_bias=True,
+                activation="mish",
+            ),
+            bias=dense1_bias,
+        )
+    else:
+        matmul(
+            context.builder,
+            context.kernels,
+            hidden,
+            body,
+            dense1_weights,
+            MatmulSpecialization(
+                token_rows,
+                hidden_width,
+                body_width,
+                context.architecture,
+                has_bias=True,
+                activation="mish",
+            ),
+            bias=dense1_bias,
+        )
     branch = _temporary_f16(context, element_count=token_rows * body_width)
-    matmul(
-        context.builder,
-        context.kernels,
-        branch,
-        hidden,
-        dense2_weights,
-        MatmulSpecialization(
-            token_rows,
-            body_width,
-            hidden_width,
-            context.architecture,
-            has_bias=True,
-            has_skip=True,
-        ),
-        bias=dense2_bias,
-        skip=body,
-        alpha=alpha,
-    )
+    if _CUTLASS_FFN2:
+        cutlass_matmul(
+            context.builder,
+            context.kernels,
+            branch,
+            hidden,
+            dense2_weights,
+            CutlassMatmulSpecialization(
+                token_rows,
+                body_width,
+                hidden_width,
+                context.architecture,
+                has_bias=True,
+                has_skip=True,
+            ),
+            bias=dense2_bias,
+            skip=body,
+            alpha=alpha,
+        )
+    else:
+        matmul(
+            context.builder,
+            context.kernels,
+            branch,
+            hidden,
+            dense2_weights,
+            MatmulSpecialization(
+                token_rows,
+                body_width,
+                hidden_width,
+                context.architecture,
+                has_bias=True,
+                has_skip=True,
+            ),
+            bias=dense2_bias,
+            skip=body,
+            alpha=alpha,
+        )
     output = _temporary_f16(context, element_count=token_rows * body_width)
     layer_norm(
         context.builder,

@@ -26,7 +26,13 @@ _ATTENTION_CONFIGS = (
 
 @triton.autotune(
     configs=list(_ATTENTION_CONFIGS),
-    key=["batch_count", "model_width", "head_depth", "heads_per_sample"],
+    key=[
+        "batch_count",
+        "model_width",
+        "head_depth",
+        "heads_per_sample",
+        "has_smolgen",
+    ],
     cache_results=True,
 )
 @triton.jit
@@ -40,6 +46,7 @@ def _fused_attention_kernel(
     head_depth: tl.constexpr,
     heads_per_sample: tl.constexpr,
     block_d: tl.constexpr,
+    has_smolgen: tl.constexpr = True,  # noqa: FBT002
 ) -> None:
     """Compute fused QK, Smolgen bias, 64-way softmax, and V attention per head."""
     matrix = tl.program_id(0)
@@ -76,14 +83,18 @@ def _fused_attention_kernel(
     k_t = tl.trans(k)
     qk = tl.dot(q, k_t, out_dtype=tl.float32) * scale
 
-    # Smolgen addition
-    offs_n = tl.arange(0, _SQUARE_COUNT)
-    smolgen_base = matrix * (_SQUARE_COUNT * _SQUARE_COUNT)
-    smolgen_ptrs = (
-        smolgen + smolgen_base + offs_m[:, None] * _SQUARE_COUNT + offs_n[None, :]
-    )
-    smolgen_vals = tl.load(smolgen_ptrs).to(tl.float32)
-    logits = qk + smolgen_vals
+    # Smolgen addition. `has_smolgen` is a constexpr, so on a net without
+    # smolgen the load is not merely skipped at runtime -- it is not compiled,
+    # and the `smolgen` pointer is never dereferenced.
+    if has_smolgen:
+        offs_n = tl.arange(0, _SQUARE_COUNT)
+        smolgen_base = matrix * (_SQUARE_COUNT * _SQUARE_COUNT)
+        smolgen_ptrs = (
+            smolgen + smolgen_base + offs_m[:, None] * _SQUARE_COUNT + offs_n[None, :]
+        )
+        logits = qk + tl.load(smolgen_ptrs).to(tl.float32)
+    else:
+        logits = qk
 
     # Clamping
     is_nan = logits != logits  # noqa: PLR0124  # Device-side NaN test.
@@ -123,6 +134,7 @@ class FusedAttentionSpecialization:
     head_depth: int
     heads_per_sample: int
     architecture: int
+    has_smolgen: bool = True
 
 
 def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
@@ -152,7 +164,7 @@ def compile_fused_attention(
         device="cuda",
     )
     smolgen = torch.zeros(
-        (specialization.batch_count, 64, 64),
+        (specialization.batch_count if specialization.has_smolgen else 1, 64, 64),
         dtype=torch.float16,
         device="cuda",
     )
@@ -169,6 +181,7 @@ def compile_fused_attention(
         specialization.head_depth,
         specialization.heads_per_sample,
         block_d,
+        specialization.has_smolgen,
     )
     return artifact_from_triton(
         compiled,
@@ -183,7 +196,7 @@ def fused_attention(
     kernels: KernelCache,
     output: Buffer,
     qkv: Buffer,
-    smolgen: Buffer,
+    smolgen: Buffer | None,
     scale: Buffer,
     specialization: FusedAttentionSpecialization,
 ) -> None:
@@ -193,11 +206,15 @@ def fused_attention(
         f"sm_{specialization.architecture}",
     )
     kernel = kernels.get(compile_fused_attention, specialization)
+    # Without smolgen the kernel keeps the pointer parameter but never
+    # dereferences it, so `scale` stands in: a real, live, read-only buffer, so
+    # the artifact's parameter table stays well-formed and nothing dangles.
+    smolgen_argument = smolgen if specialization.has_smolgen else scale
     builder.call(
         kernel,
         output,
         qkv,
-        smolgen,
+        smolgen_argument,
         scale,
-        readonly=[qkv, smolgen, scale],
+        readonly=[qkv, smolgen_argument, scale],
     )

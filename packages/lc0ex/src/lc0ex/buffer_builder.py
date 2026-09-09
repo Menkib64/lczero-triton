@@ -131,6 +131,28 @@ class Buffer:
         self._builder.register_external_view(self, name=name)
         return self
 
+    def as_tensor(
+        self,
+        shape: Sequence[int],
+        dtype: lc0ex_pb2.Buffer.DataType | None = None,
+    ) -> "Buffer":
+        """Return a shaped, contiguous view of this buffer's storage.
+
+        `temporary_buffer` hands out an opaque range with no shape, which cannot
+        be indexed.  This attaches a row-major interpretation to it so it can be
+        sliced by sample; the storage, offset and writability are unchanged.
+        """
+        return Buffer(
+            storage=self.root_storage,
+            offset=self._offset,
+            shape=shape,
+            strides=None,
+            dtype=self._dtype if dtype is None else dtype,
+            allocation=self._allocation,
+            builder=self._builder,
+            writable=self._writable,
+        )
+
     def transpose(self, dim0: int, dim1: int) -> "Buffer":
         """Return a transposed view swapping *dim0* and *dim1*."""
         ndim = len(self._shape)
@@ -430,6 +452,15 @@ class BufferBuilder:
             ),
         )
         return buffer
+
+    def storage_size_bytes(self, buffer: Buffer) -> int:
+        """Return the byte extent of *buffer*'s root storage.
+
+        `Buffer.size_bytes` is the dense size of a SHAPED buffer and is 0 for the
+        opaque raw temporaries `temporary_buffer` hands out, so the physical
+        extent lives only in the record.
+        """
+        return self._records[buffer.root_storage].size_bytes
 
     def is_reusable(self, buffer: Buffer) -> bool:
         """Return whether *buffer* is an internal reusable range."""

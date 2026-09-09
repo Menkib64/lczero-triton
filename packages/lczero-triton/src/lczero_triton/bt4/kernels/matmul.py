@@ -12,6 +12,7 @@ from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
 from lczero_triton.bt4.kernels._autotune import cold_do_bench
+from lczero_triton.bt4.kernels import _config_reuse
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 Activation = Literal["none", "mish", "relu", "swish"]
@@ -164,7 +165,23 @@ def _prune_matmul_configs(  # noqa: C901, PLR0912
             continue
         pruned.append(conf)
 
-    return pruned or [configs[0]]
+    survivors = pruned or [configs[0]]
+    # Seeding runs LAST, on what structural pruning left, so it can only ever
+    # narrow a legal candidate set and never widen it into something that will
+    # not compile.
+    seeded = _config_reuse.seed(
+        "_matmul_skip_kernel" if "skip" in named_args else "_matmul_kernel",
+        survivors,
+        m_val,
+        n_val,
+        k_val,
+        (
+            named_args.get("has_bias", kwargs.get("has_bias")),
+            named_args.get("activation", kwargs.get("activation")),
+        ),
+    )
+    return survivors if seeded is None else seeded
+
 
 
 @triton.autotune(

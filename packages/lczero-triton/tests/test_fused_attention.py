@@ -115,7 +115,7 @@ def test_fused_attention_matches_reference() -> None:
     diff = (out_fused - out_sep).abs().max().item()
     assert diff < _TOLERANCE
 
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=_F16)
     program = builder.program(name="main")
     cache = KernelCache(builder)
 

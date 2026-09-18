@@ -33,7 +33,7 @@ def _compiler(spec: _Specialization) -> KernelArtifact:
 
 def test_kernel_cache_reuses_one_compiler_specialization_pair() -> None:
     """Equivalent immutable requests compile once and reuse one handle."""
-    cache = KernelCache(ExecutableBuilder())
+    cache = KernelCache(ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16))
 
     first = cache.get(_compiler, _Specialization(32))
     second = cache.get(_compiler, _Specialization(32))
@@ -43,7 +43,7 @@ def test_kernel_cache_reuses_one_compiler_specialization_pair() -> None:
 
 def test_kernel_cache_logs_compile_and_reuse(caplog: pytest.LogCaptureFixture) -> None:
     """Compilation progress is visible while cache hits remain debug-level."""
-    cache = KernelCache(ExecutableBuilder())
+    cache = KernelCache(ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16))
     caplog.set_level(logging.DEBUG)
 
     cache.get(_compiler, _Specialization(32))
@@ -60,7 +60,7 @@ def test_kernel_cache_logs_compile_and_reuse(caplog: pytest.LogCaptureFixture) -
 
 def test_kernel_cache_keeps_distinct_specializations_separate() -> None:
     """A changed compile-time parameter receives a distinct artifact handle."""
-    cache = KernelCache(ExecutableBuilder())
+    cache = KernelCache(ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16))
 
     first = cache.get(_compiler, _Specialization(32))
     second = cache.get(_compiler, _Specialization(64))

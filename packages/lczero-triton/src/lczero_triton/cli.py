@@ -9,6 +9,7 @@ from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 
 from lc0ex import ExecutableBuilder
+from lc0ex.proto import lc0ex_pb2
 
 from lczero_triton.bt4._format import load_network
 from lczero_triton.bt4.network import build
@@ -25,7 +26,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _configure_logging()
     _LOGGER.info("loading network %s", arguments.network)
     network = load_network(arguments.network)
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
     _LOGGER.info("starting graph construction")
     with _autotune_progress(), redirect_stdout(sys.stderr):
         build(

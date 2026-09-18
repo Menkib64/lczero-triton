@@ -33,6 +33,27 @@ class _KernelInvocation:
     arguments: tuple[Buffer | SymbolHandle, ...]
     readonly: frozenset[Buffer]
 
+@dataclass(frozen=True, slots=True)
+class _MemcpyInvocation:
+    """One invocation of a memcpy operation."""
+    dst: Buffer
+    src: Buffer
+    arguments: tuple[Buffer, ...]
+    readonly: frozenset[Buffer]
+
+@dataclass(frozen=True, slots=True)
+class _EventWaitInvocation:
+    """One invocation of an event wait operation."""
+    event: lc0ex_pb2.Node.WaitEvent
+    arguments: list[Buffer]
+    readonly: frozenset[Buffer]
+
+@dataclass(frozen=True, slots=True)
+class _EventRecordInvocation:
+    """One invocation of an event record operation."""
+    event: lc0ex_pb2.Node.RecordEvent
+    arguments: list[Buffer]
+    readonly: frozenset[Buffer]
 
 class ProgramBuilder:
     """Build one program and its private execution allocation."""
@@ -42,13 +63,23 @@ class ProgramBuilder:
         owner: "ExecutableBuilder",
         name: str,
         metadata: bytes | None,
+        io_data_type: Literal[
+            lc0ex_pb2.Buffer.DATA_TYPE_F16,
+            lc0ex_pb2.Buffer.DATA_TYPE_F32,
+        ],
     ) -> None:
         """Initialize a program owned by *owner*."""
         self._owner = owner
         self._name = name
         self.metadata = metadata
+        self.io_data_type = io_data_type
         self._allocation = owner._buffers.execution_allocation()  # noqa: SLF001
-        self._invocations: list[_KernelInvocation] = []
+        self._invocations: list[
+                _KernelInvocation |
+                _MemcpyInvocation |
+                _EventRecordInvocation |
+                _EventWaitInvocation
+            ] = []
 
     @property
     def name(self) -> str:
@@ -72,6 +103,20 @@ class ProgramBuilder:
             dtype=dtype,
             writable=writable,
             alignment_bytes=alignment_bytes,
+        )
+
+    def host_buffer(
+        self,
+        *,
+        shape: Sequence[int],
+        dtype: lc0ex_pb2.Buffer.DataType,
+        writable: bool = False,
+    ) -> Buffer:
+        """Create a named host buffer in this program's allocation."""
+        return self._owner._buffers.host_buffer(  # noqa: SLF001
+            shape=shape,
+            dtype=dtype,
+            writable=writable,
         )
 
     def temporary_buffer(self, *, size_bytes: int, alignment_bytes: int) -> Buffer:
@@ -201,12 +246,65 @@ class ProgramBuilder:
             ),
         )
 
+    def memcpy(
+        self,
+        dst: Buffer,
+        src: Buffer,
+    ) -> None:
+        if dst.is_host() and src.is_host():
+            raise ValueError("Memcpy between two host buffers is not allowed.")
+        if not dst.is_host() and not src.is_host():
+            raise ValueError("Memcpy between two device buffers is not allowed.")
+        """Append a memcpy operation to this program."""
+        self._invocations.append(
+            _MemcpyInvocation(
+                dst=dst,
+                src=src,
+                arguments=(dst, src),
+                readonly=frozenset({src})
+            ),
+        )
+
+    def event_record(
+        self,
+        event: lc0ex_pb2.Node.RecordEvent,
+        buffer: list[Buffer],
+    ) -> None:
+        """Append an event record operation to this program."""
+        arguments = tuple(b for b in buffer if isinstance(b, Buffer))
+        self._invocations.append(
+            _EventRecordInvocation(
+                event=event,
+                arguments=arguments,
+                readonly=frozenset(buffer),
+            ),
+        )
+
+    def event_wait(
+        self,
+        event: lc0ex_pb2.Node.WaitEvent,
+        buffer: list[Buffer],
+    ) -> None:
+        """Append an event wait operation to this program."""
+        arguments = tuple(b for b in buffer if isinstance(b, Buffer))
+        self._invocations.append(
+            _EventWaitInvocation(
+                event=event,
+                arguments=arguments,
+                readonly=frozenset({}),
+            ),
+        )
+
 
 class ExecutableBuilder:
     """Build an Lc0 neural executable with shared persistent storage."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        io_data_type: Literal[lc0ex_pb2.Buffer.DATA_TYPE_F16, lc0ex_pb2.Buffer.DATA_TYPE_F32]
+    ) -> None:
         """Initialize an empty executable builder."""
+        self.io_data_type = io_data_type
         self._target: tuple[lc0ex_pb2.Target.Vendor, str] | None = None
         self._metadata: bytes | None = None
         self._buffers = BufferBuilder()
@@ -251,6 +349,20 @@ class ExecutableBuilder:
             alignment_bytes=alignment_bytes,
         )
 
+    def host_buffer(
+        self,
+        *,
+        shape: Sequence[int],
+        dtype: lc0ex_pb2.Buffer.DataType,
+        writable: bool = False,
+    ) -> Buffer:
+        """Create a named host buffer in the executable allocation."""
+        return self._buffers.host_buffer(
+            shape=shape,
+            dtype=dtype,
+            writable=writable
+        )
+
     def program(
         self,
         *,
@@ -259,7 +371,7 @@ class ExecutableBuilder:
     ) -> ProgramBuilder:
         """Create a named program with a private execution allocation."""
         normalized_metadata = None if metadata is None else bytes(metadata)
-        result = ProgramBuilder(self, name, normalized_metadata)
+        result = ProgramBuilder(self, name, normalized_metadata, self.io_data_type)
         self._programs.append(result)
         return result
 
@@ -309,6 +421,7 @@ class ExecutableBuilder:
             executable.target.vendor = vendor
             executable.target.architecture = architecture
 
+        executable.io_data_type = self.io_data_type
         persistent_conflicts: dict[Buffer, set[Buffer]] = {}
         persistent_plan = self._buffers.plan(
             self._buffers.persistent_allocation(),
@@ -470,47 +583,79 @@ class ExecutableBuilder:
             dependencies,
             strict=True,
         ):
-            artifact = self._kernels[invocation.kernel]
-            node = destination.nodes.add(
-                kernel_idx=kernel_indices[invocation.kernel],
-                dependencies=invocation_dependencies,
-                grid=artifact.grid,
-                block=artifact.block,
-                dynamic_shared_memory_bytes=artifact.dynamic_shared_memory_bytes,
-            )
-            for argument in invocation.arguments:
-                if isinstance(argument, Buffer):
-                    # A view is not in the plan: its address is its root's
-                    # planned offset plus its own byte offset.
-                    location = locations.get(argument)
-                    if location is None:
-                        root_location = locations[argument.root_storage]
-                        location = BufferLocation(
-                            root_location.allocation,
-                            root_location.offset + argument.offset,
-                        )
-                    allocation_kind = (
-                        lc0ex_pb2.Node.Argument.AllocationLocation.AllocationKind
-                    )
-                    allocation = (
-                        allocation_kind.ALLOCATION_PERSISTENT
-                        if location.allocation.is_persistent()
-                        else allocation_kind.ALLOCATION_EXECUTION
-                    )
-                    node.arguments.add(
-                        allocation=lc0ex_pb2.Node.Argument.AllocationLocation(
-                            kind=allocation,
-                            offset=location.offset,
-                        )
-                    )
+            if isinstance(invocation, _MemcpyInvocation):
+                if invocation.src.is_host():
+                    gpu_buffer = invocation.dst
                 else:
-                    binary_idx, symbol_name = symbol_locations[argument]
-                    node.arguments.add(
-                        symbol=lc0ex_pb2.Node.Argument.Symbol(
-                            binary_idx=binary_idx,
-                            symbol_name=symbol_name,
+                    gpu_buffer = invocation.src
+                info = next((eb for eb in plan.external_buffers if eb[0] is gpu_buffer), None)
+                if info is None:
+                    msg = f"Buffer {gpu_buffer} not found in external buffers."
+                    raise ValueError(msg)
+                gpu_name = info[1].name
+                location = plan.locations[gpu_buffer]
+                destination.nodes.add(
+                    memcpy=lc0ex_pb2.Node.Memcpy(
+                        name=gpu_name,
+                        gpu_offset=location.offset,
+                    ),
+                    dependencies=invocation_dependencies,
+                )
+            elif isinstance(invocation, _EventRecordInvocation):
+                destination.nodes.add(
+                    record_event=invocation.event,
+                    dependencies=invocation_dependencies,
+                )
+            elif isinstance(invocation, _EventWaitInvocation):
+                destination.nodes.add(
+                    wait_event=invocation.event,
+                    dependencies=invocation_dependencies,
+                )
+            elif isinstance(invocation, _KernelInvocation):
+                artifact = self._kernels[invocation.kernel]
+                node = destination.nodes.add(
+                    kernel_idx=kernel_indices[invocation.kernel],
+                    dependencies=invocation_dependencies,
+                    grid=artifact.grid,
+                    block=artifact.block,
+                    dynamic_shared_memory_bytes=artifact.dynamic_shared_memory_bytes,
+                )
+                for argument in invocation.arguments:
+                    if isinstance(argument, Buffer):
+#A view is not in the plan : its address is its root's
+#planned offset plus its own byte offset.
+                        location = locations.get(argument)
+                        if location is None:
+                            root_location = locations[argument.root_storage]
+                            location = BufferLocation(
+                                root_location.allocation,
+                                root_location.offset + argument.offset,
+                            )
+                        allocation_kind = (
+                            lc0ex_pb2.Node.Argument.AllocationLocation.AllocationKind
                         )
-                    )
+                        allocation = (
+                            allocation_kind.ALLOCATION_PERSISTENT
+                            if location.allocation.is_persistent()
+                            else allocation_kind.ALLOCATION_EXECUTION
+                        )
+                        node.arguments.add(
+                            allocation=lc0ex_pb2.Node.Argument.AllocationLocation(
+                                kind=allocation,
+                                offset=location.offset,
+                            )
+                        )
+                    else:
+                        binary_idx, symbol_name = symbol_locations[argument]
+                        node.arguments.add(
+                            symbol=lc0ex_pb2.Node.Argument.Symbol(
+                                binary_idx=binary_idx,
+                                symbol_name=symbol_name,
+                            )
+                        )
+            else:
+                msg = f"Unexpected invocation type: {type(invocation)}"
+                raise TypeError(msg)
 
     def _hazard_range(self, buffer: Buffer) -> tuple[Buffer, int, int]:
         """Return the (root storage, first byte, last byte + 1) a buffer touches.

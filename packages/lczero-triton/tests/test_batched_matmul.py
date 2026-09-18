@@ -330,7 +330,7 @@ def test_graph_call_has_only_physical_operands(
     operation: BatchedMatmulOperation,
 ) -> None:
     """The graph ABI allocates no pointer arrays or head-layout temporaries."""
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
     program = builder.program(name="main")
     heads = _TEST_HEADS if operation != "policy_qk" else 1
     batch_count = 2 * heads
@@ -401,7 +401,7 @@ def test_graph_call_has_only_physical_operands(
 @_CUDA_REQUIRED
 def test_graph_dependencies_follow_physical_buffer_flow() -> None:
     """A subsequent QK read depends on the producer of its query buffer."""
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
     program = builder.program(name="main")
     specialization = BatchedMatmulSpecialization(
         "body_qk", 4, 16, 16, 16, _TEST_HEADS, _architecture()

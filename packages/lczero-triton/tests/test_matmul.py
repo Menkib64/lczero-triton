@@ -171,7 +171,7 @@ def test_compilation_captures_selected_configuration_and_static_launch() -> None
 
 def test_graph_call_preserves_output_activation_weight_order() -> None:
     """The graph ABI places the destination before both readonly operands."""
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
     program = builder.program(name="main")
     output = program.buffer(
         name="output",
@@ -271,7 +271,7 @@ def test_matmul_fused_skip_numerical_accuracy() -> None:
 
 def test_matmul_fused_skip_graph_call() -> None:
     """The graph ABI for fused skip passes 6 buffers in expected order."""
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
     program = builder.program(name="main")
     output = program.buffer(
         name="output",

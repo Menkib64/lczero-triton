@@ -235,7 +235,7 @@ def _external_buffer(
 @_CUDA_REQUIRED
 def test_graph_call_uses_in_place_records_and_tracks_dependencies() -> None:
     """Promotion calls expose only physical tensors and serialize record writes."""
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
     program = builder.program(name="main")
     specialization = PromotionLogitsSpecialization(2, 32, _architecture())
     policy_records = _external_buffer(

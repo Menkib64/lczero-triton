@@ -110,7 +110,7 @@ def test_real_compilation_produces_pointer_abi_and_static_launch() -> None:
 
 def test_copy_graph_call_preserves_output_input_argument_order() -> None:
     """The family API serializes destination before its readonly source."""
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
     program = builder.program(name="main")
     output = program.buffer(
         name="output",
@@ -207,7 +207,7 @@ def test_remaining_step_five_families_capture_autotuned_artifacts() -> None:
 
 def test_policy_map_serializes_embedded_symbol_argument() -> None:
     """Policy gathering uses a module symbol rather than an external buffer."""
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
     program = builder.program(name="main")
     output = program.buffer(
         name="output",

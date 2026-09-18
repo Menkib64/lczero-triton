@@ -220,7 +220,7 @@ def _external_buffer(
 @_CUDA_REQUIRED
 def test_graph_call_preserves_in_place_abi_and_dependencies() -> None:
     """An in-place QK write remains visible to the following attention consumer."""
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
     program = builder.program(name="main")
     shape = (4, _SOFTMAX_WIDTH)
     scaled_qk = _external_buffer(program, "scaled_qk", shape, writable=True)

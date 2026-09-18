@@ -20,7 +20,7 @@ TARGET_ARCHITECTURE = "sm_80"
 
 def _builder() -> ExecutableBuilder:
     """Create a target-configured executable builder."""
-    return ExecutableBuilder().set_target(
+    return ExecutableBuilder(io_data_type=F16).set_target(
         lc0ex_pb2.Target.VENDOR_NVIDIA,
         TARGET_ARCHITECTURE,
     )

@@ -20,7 +20,7 @@ TARGET_ARCHITECTURE = "sm_80"
 
 def _builder() -> ExecutableBuilder:
     """Create a fully target-configured executable builder."""
-    return ExecutableBuilder().set_target(
+    return ExecutableBuilder(io_data_type=F16).set_target(
         lc0ex_pb2.Target.VENDOR_NVIDIA,
         TARGET_ARCHITECTURE,
     )
@@ -246,4 +246,4 @@ def test_build_and_write_requires_a_target(tmp_path: Path) -> None:
     output_path = tmp_path / "incomplete.lc0ex"
 
     with pytest.raises(EncodeError):
-        ExecutableBuilder().build_and_write(output_path)
+        ExecutableBuilder(io_data_type=F16).build_and_write(output_path)

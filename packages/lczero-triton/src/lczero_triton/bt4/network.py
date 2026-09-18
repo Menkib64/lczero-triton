@@ -374,6 +374,14 @@ def _fingerprint_network(
 
 def _inputs(context: _BuildContext) -> tuple[Buffer, Buffer]:
     """Declare the packed execution inputs consumed by plane expansion."""
+    host_masks = context.builder.host_buffer(
+        shape=(context.batch_size, _INPUT_CHANNELS),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_U64,
+    )
+    host_values = context.builder.host_buffer(
+        shape=(context.batch_size, _INPUT_CHANNELS),
+        dtype=context.builder.io_data_type,
+    )
     masks = context.builder.buffer(
         name="/input/plane_masks",
         shape=(context.batch_size, _INPUT_CHANNELS),
@@ -382,7 +390,13 @@ def _inputs(context: _BuildContext) -> tuple[Buffer, Buffer]:
     values = context.builder.buffer(
         name="/input/plane_values",
         shape=(context.batch_size, _INPUT_CHANNELS),
-        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32,
+        dtype=context.builder.io_data_type,
+    )
+    context.builder.memcpy(dst=masks, src=host_masks)
+    context.builder.memcpy(dst=values, src=host_values)
+    context.builder.event_wait(
+        event="/event/compute_ordering",
+        buffer=[masks, values],
     )
     return masks, values
 
@@ -709,6 +723,14 @@ def _encoder_tower(
             head_count=weights.headcount,
             shared_smolgen=weights.smolgen_w if _has_smolgen(weights) else None,
         )
+    context.builder.event_record(
+        event="/event/compute_ordering",
+        buffer=[body],
+    )
+    context.builder.event_record(
+        event="/event/sleep",
+        buffer=[body],
+    )
     return body
 
 
@@ -1472,7 +1494,12 @@ def _policy_head(
     output = context.builder.buffer(
         name="/output/policy",
         shape=(context.batch_size, 1858),
-        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32,
+        dtype=context.builder.io_data_type,
+        writable=True,
+    )
+    output_host = context.builder.host_buffer(
+        shape=(context.batch_size, 1858),
+        dtype=context.builder.io_data_type,
         writable=True,
     )
 
@@ -1556,6 +1583,11 @@ def _policy_head(
         mapping,
         PolicyMapSpecialization(context.batch_size, context.architecture),
     )
+    context.builder.memcpy(dst=output_host,src=output)
+    context.builder.event_record(
+        event="/event/policy_done",
+        buffer=[output_host],
+    )
 
 
 def _value_head(
@@ -1580,6 +1612,7 @@ def _value_head(
         output_name="/output/wdl",
         output_width=3,
         final_activation="none",
+        event="/event/wdl_done",
     )
 
 
@@ -1605,6 +1638,7 @@ def _moves_left_head(
         output_name="/output/mlh",
         output_width=1,
         final_activation="relu",
+        event="/event/mlh_done",
     )
 
 
@@ -1624,6 +1658,7 @@ def _dense_output_head(  # noqa: PLR0913
     output_name: str,
     output_width: int,
     final_activation: Literal["none", "relu"],
+    event: lc0ex_pb2.Node.Event,
 ) -> None:
     """Build a per-square embedding followed by two flattened dense layers."""
     embed_weights, embed_width = _matrix_f16(
@@ -1669,7 +1704,12 @@ def _dense_output_head(  # noqa: PLR0913
     output = context.builder.buffer(
         name=output_name,
         shape=(context.batch_size, output_width),
-        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32,
+        dtype=context.builder.io_data_type,
+        writable=True,
+    )
+    output_host = context.builder.host_buffer(
+        shape=(context.batch_size, output_width),
+        dtype=context.builder.io_data_type,
         writable=True,
     )
 
@@ -1721,9 +1761,13 @@ def _dense_output_head(  # noqa: PLR0913
             context.architecture,
             has_bias=True,
             activation=final_activation,
-            output_f32=True,
         ),
         bias=result_bias,
+    )
+    context.builder.memcpy(dst=output_host, src=output)
+    context.builder.event_record(
+        event=event,
+        buffer=[output_host],
     )
 
 

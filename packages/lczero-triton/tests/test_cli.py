@@ -58,6 +58,9 @@ def test_main_keeps_artifact_path_on_stdout_and_progress_on_stderr(
     """Autotuning-style progress does not corrupt the stdout artifact path."""
 
     class _Builder:
+        def __init__(self, *args, io_data_type, **kwargs) -> None:
+            assert args == ()
+            assert kwargs == {}
         def build_and_write(self, output: Path) -> None:
             assert output == Path("output.lc0ex")
 

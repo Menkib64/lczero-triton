@@ -2,6 +2,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum
 from math import prod
 from typing import Self
 
@@ -34,17 +35,31 @@ def data_type_size_bytes(dtype: lc0ex_pb2.Buffer.DataType) -> int:
     }
     return sizes[dtype]
 
+class BufferType(Enum):
+    """The type of a logical buffer."""
+
+    PERSISTENT = 1
+    EXECUTION = 2
+    HOST = 3
+
 
 @dataclass(frozen=True, slots=True, eq=False)
 class Allocation:
     """A logical device-memory allocation owned by a buffer builder."""
 
-    _persistent: bool
+    _type: BufferType
 
     def is_persistent(self) -> bool:
         """Return whether this allocation belongs to the executable."""
-        return self._persistent
+        return self._type == BufferType.PERSISTENT
 
+    def is_execution(self) -> bool:
+        """Return whether this allocation belongs to one program execution."""
+        return self._type == BufferType.EXECUTION
+
+    def is_host(self) -> bool:
+        """Return whether this allocation belongs to host memory."""
+        return self._type == BufferType.HOST
 
 class Buffer:
     """An opaque identity or view for one logical device-memory range."""
@@ -122,6 +137,10 @@ class Buffer:
     def is_contiguous(self) -> bool:
         """Return whether this buffer is contiguous in row-major order."""
         return self._strides == default_strides(self._shape)
+
+    def is_host(self) -> bool:
+        """Return whether this buffer is in host memory."""
+        return self._allocation is not None and self._allocation.is_host()
 
     def external(self, name: str) -> Self:
         """Register this buffer view as a named external buffer."""
@@ -267,6 +286,14 @@ class _ExternalBuffer:
     strides: tuple[int, ...] | None = None
     offset_in_storage: int = 0
 
+@dataclass(frozen=True, slots=True)
+class _HostBuffer:
+    """Canonical metadata for one named host buffer range."""
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: lc0ex_pb2.Buffer.DataType
+    strides: tuple[int, ...] | None = None
 
 @dataclass(frozen=True, slots=True)
 class _BufferRecord:
@@ -311,7 +338,7 @@ class BufferBuilder:
 
     def __init__(self) -> None:
         """Initialize an empty allocation collection."""
-        self._persistent = Allocation(_persistent=True)
+        self._persistent = Allocation(_type=BufferType.PERSISTENT)
         self._buffers_by_allocation: dict[Allocation, list[Buffer]] = {
             self._persistent: [],
         }
@@ -326,7 +353,13 @@ class BufferBuilder:
 
     def execution_allocation(self) -> Allocation:
         """Create and return a new program execution allocation."""
-        allocation = Allocation(_persistent=False)
+        allocation = Allocation(_type=BufferType.EXECUTION)
+        self._buffers_by_allocation[allocation] = []
+        return allocation
+
+    def host_allocation(self) -> Allocation:
+        """Create and return a new host memory allocation."""
+        allocation = Allocation(_type=BufferType.HOST)
         self._buffers_by_allocation[allocation] = []
         return allocation
 
@@ -427,6 +460,21 @@ class BufferBuilder:
         )
         buf.external(name)
         return buf
+
+    def host_buffer(
+        self,
+        *,
+        shape: Sequence[int],
+        dtype: lc0ex_pb2.Buffer.DataType,
+        writable: bool,
+    ) -> Buffer:
+        """Create or retrieve a named host buffer in the persistent allocation."""
+        return self.tensor(
+            self.host_allocation(),
+            shape=shape,
+            dtype=dtype,
+            writable=writable,
+        )
 
     def temporary_buffer(
         self,

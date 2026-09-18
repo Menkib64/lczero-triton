@@ -371,7 +371,7 @@ def _external_buffer(
 @_CUDA_REQUIRED
 def test_graph_call_preserves_deepnorm_argument_order() -> None:
     """DeepNorm graph arguments follow the fused CUDA operation's pointer ABI."""
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
     program = builder.program(name="main")
     output = _external_buffer(program, "output", (2, 256), writable=True)
     input_ = _external_buffer(program, "input", (2, 256))
@@ -422,7 +422,7 @@ def test_graph_call_preserves_deepnorm_argument_order() -> None:
 @_CUDA_REQUIRED
 def test_layer_norm_no_bias_graph_call() -> None:
     """When has_bias=False, dummy bias pointer is passed and not loaded."""
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
     program = builder.program(name="main")
     output = _external_buffer(program, "output", (2, 256), writable=True)
     input_ = _external_buffer(program, "input", (2, 256))

@@ -36,7 +36,7 @@ def _expand_planes_kernel(
     plane = offsets // square_count
     square = offsets % square_count
     mask_values = tl.load(masks + plane, mask=valid, other=0)
-    plane_values = tl.load(values + plane, mask=valid, other=0.0).to(tl.float16)
+    plane_values = tl.load(values + plane, mask=valid, other=0.0)
     is_set = ((mask_values >> square) & 1) != 0
     expanded = tl.where(is_set, plane_values, 0.0)
     tl.store(output + offsets, expanded, mask=valid)
@@ -87,7 +87,7 @@ def compile_expand_planes(
     )
     values = torch.zeros(
         specialization.plane_count,
-        dtype=torch.float32,
+        dtype=torch.float16,
         device="cuda",
     )
     compiled = _expand_planes_kernel[_autotune_grid](

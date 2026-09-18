@@ -46,7 +46,7 @@ def _policy_map_kernel(
         mask=valid_source,
         other=0.0,
     )
-    tl.store(output + offsets, values.to(tl.float32), mask=valid)
+    tl.store(output + offsets, values, mask=valid)
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +97,7 @@ def compile_policy_map(
 ) -> KernelArtifact:
     """Autotune and compile one FP32 attention-policy gather specialization."""
     element_count = specialization.batch_size * specialization.output_element_count
-    output = torch.empty(element_count, dtype=torch.float32, device="cuda")
+    output = torch.empty(element_count, dtype=torch.float16, device="cuda")
     input_ = torch.zeros(
         specialization.batch_size * specialization.input_element_count,
         dtype=torch.float16,

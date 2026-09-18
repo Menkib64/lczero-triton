@@ -605,7 +605,7 @@ def test_build_normalizes_and_builds_encoder(
     _stub_compilers(monkeypatch)
     _stop_after_encoders(monkeypatch)
 
-    build(ExecutableBuilder(), network, batch_sizes=(1,))
+    build(ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16), network, batch_sizes=(1,))
 
     assert (
         network.format.network_format.network
@@ -624,7 +624,7 @@ def test_build_stores_sparse_network_fingerprint(
     network = _embedding_network(encoding_width=1, body_width=16, hidden_width=32)
     _stub_compilers(monkeypatch)
     _stop_after_embedding(monkeypatch)
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
 
     build(builder, network, batch_sizes=(2,))
 
@@ -669,8 +669,8 @@ def test_fingerprint_ignores_weight_values_encodings_and_batch_sizes(
 
     _stub_compilers(monkeypatch)
     _stop_after_embedding(monkeypatch)
-    first_builder = ExecutableBuilder()
-    second_builder = ExecutableBuilder()
+    first_builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
+    second_builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
     build(first_builder, first, batch_sizes=(1,))
     build(second_builder, second, batch_sizes=(3,))
 
@@ -684,7 +684,7 @@ def test_build_can_emit_multiple_program_specific_batch_allocations(
     network = _embedding_network(encoding_width=1, body_width=16, hidden_width=32)
     _stub_compilers(monkeypatch)
     _stop_after_embedding(monkeypatch)
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
 
     build(builder, network, batch_sizes=(1, 3))
     executable = builder.build()
@@ -730,7 +730,7 @@ def test_full_graph_fingerprint_contains_all_active_layers(
         moves_hidden_width=5,
     )
     _stub_head_compilers(monkeypatch)
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
 
     build(builder, network, batch_sizes=(1,))
 
@@ -750,8 +750,8 @@ def test_fingerprint_changes_when_semantic_enum_changes(
 
     _stub_compilers(monkeypatch)
     _stop_after_embedding(monkeypatch)
-    first_builder = ExecutableBuilder()
-    second_builder = ExecutableBuilder()
+    first_builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
+    second_builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
     build(first_builder, first, batch_sizes=(1,))
     build(second_builder, second, batch_sizes=(1,))
 
@@ -775,7 +775,7 @@ def test_encoder_builds_names_order_and_specializations(
     )
     records = _stub_compilers(monkeypatch)
     _stop_after_encoders(monkeypatch)
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
 
     build(builder, network, batch_sizes=(2,))
     executable = builder.build()
@@ -856,7 +856,7 @@ def test_embedding_infers_external_shapes_from_layer_counts(
     )
     _stub_compilers(monkeypatch)
     _stop_after_embedding(monkeypatch)
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
 
     build(builder, network, batch_sizes=(2,))
     executable = builder.build()
@@ -919,7 +919,7 @@ def test_embedding_builds_expected_operations_and_specializations(
     network = _embedding_network(encoding_width=3, body_width=32, hidden_width=48)
     records = _stub_compilers(monkeypatch)
     _stop_after_embedding(monkeypatch)
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
 
     build(builder, network, batch_sizes=(2,))
     executable = builder.build()
@@ -980,7 +980,7 @@ def test_embedding_preserves_pointer_reinterpretation_skip_and_reuse(
     network = _embedding_network(encoding_width=3, body_width=32, hidden_width=48)
     _stub_compilers(monkeypatch)
     _stop_after_embedding(monkeypatch)
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
 
     build(builder, network, batch_sizes=(2,))
     executable = builder.build()
@@ -1040,7 +1040,7 @@ def test_output_heads_build_contracts_and_independent_branches(
     )
     records = _stub_head_compilers(monkeypatch)
     monkeypatch.setattr(network_module, "_encoder_tower", _keep_body)
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
 
     build(builder, network, batch_sizes=(2,))
     executable = builder.build()
@@ -1157,7 +1157,7 @@ def test_policy_embedding_prefers_head_local_weights(
     _set_elements(network.weights.policy_heads.vanilla.ip3_pol_w, 10 * 8)
     _stub_head_compilers(monkeypatch)
     monkeypatch.setattr(network_module, "_encoder_tower", _keep_body)
-    builder = ExecutableBuilder()
+    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
 
     build(builder, network, batch_sizes=(1,))
     buffers = {buffer.name: tuple(buffer.shape) for buffer in builder.build().buffers}

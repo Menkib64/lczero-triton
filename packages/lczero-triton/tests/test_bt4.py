@@ -387,6 +387,7 @@ def _keep_body(
     weights: net_pb2.Weights,
 ) -> Buffer:
     """Skip encoder construction while retaining the embedding body."""
+    context.builder.priority = context.builder.priority - 1
     del context, body_width, weights
     return body
 

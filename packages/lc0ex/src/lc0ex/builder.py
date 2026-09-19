@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
 from typing import Self
+import torch
 
 from lc0ex.buffer_builder import (
     AllocationPlan,
@@ -29,6 +30,7 @@ _FORMAT = 1
 class _KernelInvocation:
     """One invocation of a registered kernel."""
 
+    priority: int
     kernel: KernelHandle
     arguments: tuple[Buffer | SymbolHandle, ...]
     readonly: frozenset[Buffer]
@@ -36,6 +38,8 @@ class _KernelInvocation:
 @dataclass(frozen=True, slots=True)
 class _MemcpyInvocation:
     """One invocation of a memcpy operation."""
+
+    priority: int
     dst: Buffer
     src: Buffer
     arguments: tuple[Buffer, ...]
@@ -44,6 +48,8 @@ class _MemcpyInvocation:
 @dataclass(frozen=True, slots=True)
 class _EventWaitInvocation:
     """One invocation of an event wait operation."""
+
+    priority: int
     event: lc0ex_pb2.Node.WaitEvent
     arguments: list[Buffer]
     readonly: frozenset[Buffer]
@@ -51,6 +57,8 @@ class _EventWaitInvocation:
 @dataclass(frozen=True, slots=True)
 class _EventRecordInvocation:
     """One invocation of an event record operation."""
+
+    priority: int
     event: lc0ex_pb2.Node.RecordEvent
     arguments: list[Buffer]
     readonly: frozenset[Buffer]
@@ -67,12 +75,15 @@ class ProgramBuilder:
             lc0ex_pb2.Buffer.DATA_TYPE_F16,
             lc0ex_pb2.Buffer.DATA_TYPE_F32,
         ],
+        priority_range: tuple[int, int],
     ) -> None:
         """Initialize a program owned by *owner*."""
         self._owner = owner
         self._name = name
         self.metadata = metadata
         self.io_data_type = io_data_type
+        self._priority_range = priority_range
+        self._priority = priority_range[0]  # default to lowest priority
         self._allocation = owner._buffers.execution_allocation()  # noqa: SLF001
         self._invocations: list[
                 _KernelInvocation |
@@ -85,6 +96,26 @@ class ProgramBuilder:
     def name(self) -> str:
         """Return the immutable program name."""
         return self._name
+
+    @property
+    def priority_range(self) -> tuple[int, int]:
+        """Return the inclusive priority range for this program."""
+        return self._priority_range
+
+    @property
+    def priority(self) -> int:
+        """Return the current priority for this program."""
+        return self._priority
+
+    @priority.setter
+    def priority(self, value: int) -> None:
+        """Set the current priority for this program."""
+        if self._priority_range[0] == self._priority_range[1]:
+            return
+        if value > self._priority_range[0] or value < self._priority_range[1]:
+            msg = f"Program priority {value} is outside the allowed range {self._priority_range}."
+            raise ValueError(msg)
+        self._priority = value
 
     def buffer(
         self,
@@ -231,6 +262,7 @@ class ProgramBuilder:
             raise ValueError(message)
         self._invocations.append(
             _KernelInvocation(
+                priority=self._priority,
                 kernel=kernel,
                 arguments=arguments,
                 readonly=frozenset(
@@ -258,6 +290,7 @@ class ProgramBuilder:
         """Append a memcpy operation to this program."""
         self._invocations.append(
             _MemcpyInvocation(
+                priority=self._priority,
                 dst=dst,
                 src=src,
                 arguments=(dst, src),
@@ -274,6 +307,7 @@ class ProgramBuilder:
         arguments = tuple(b for b in buffer if isinstance(b, Buffer))
         self._invocations.append(
             _EventRecordInvocation(
+                priority=self._priority,
                 event=event,
                 arguments=arguments,
                 readonly=frozenset(buffer),
@@ -289,6 +323,7 @@ class ProgramBuilder:
         arguments = tuple(b for b in buffer if isinstance(b, Buffer))
         self._invocations.append(
             _EventWaitInvocation(
+                priority=self._priority,
                 event=event,
                 arguments=arguments,
                 readonly=frozenset({}),
@@ -313,6 +348,7 @@ class ExecutableBuilder:
         self._symbols: dict[SymbolHandle, SymbolArtifact] = {}
         self._symbol_handles: dict[SymbolArtifact, SymbolHandle] = {}
         self._programs: list[ProgramBuilder] = []
+        self._priority_range: tuple[int, int] = torch.cuda.Stream.priority_range()
 
     def persistent_tensor(
         self,
@@ -371,7 +407,7 @@ class ExecutableBuilder:
     ) -> ProgramBuilder:
         """Create a named program with a private execution allocation."""
         normalized_metadata = None if metadata is None else bytes(metadata)
-        result = ProgramBuilder(self, name, normalized_metadata, self.io_data_type)
+        result = ProgramBuilder(self, name, normalized_metadata, self.io_data_type, self._priority_range)
         self._programs.append(result)
         return result
 
@@ -595,6 +631,7 @@ class ExecutableBuilder:
                 gpu_name = info[1].name
                 location = plan.locations[gpu_buffer]
                 destination.nodes.add(
+                    priority=invocation.priority,
                     memcpy=lc0ex_pb2.Node.Memcpy(
                         name=gpu_name,
                         gpu_offset=location.offset,
@@ -603,17 +640,20 @@ class ExecutableBuilder:
                 )
             elif isinstance(invocation, _EventRecordInvocation):
                 destination.nodes.add(
+                    priority=invocation.priority,
                     record_event=invocation.event,
                     dependencies=invocation_dependencies,
                 )
             elif isinstance(invocation, _EventWaitInvocation):
                 destination.nodes.add(
+                    priority=invocation.priority,
                     wait_event=invocation.event,
                     dependencies=invocation_dependencies,
                 )
             elif isinstance(invocation, _KernelInvocation):
                 artifact = self._kernels[invocation.kernel]
                 node = destination.nodes.add(
+                    priority=invocation.priority,
                     kernel_idx=kernel_indices[invocation.kernel],
                     dependencies=invocation_dependencies,
                     grid=artifact.grid,

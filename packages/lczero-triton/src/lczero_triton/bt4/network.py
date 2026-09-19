@@ -707,12 +707,20 @@ def _encoder_tower(
     weights: net_pb2.Weights,
 ) -> Buffer:
     """Visit each protobuf encoder in evaluation order without fixed depth."""
+    lowest = context.builder.priority_range[0]
+    priority_steps = lowest - context.builder.priority_range[1]
+    encoder_count = len(weights.encoder)
     for index, encoder in enumerate(weights.encoder):
+        step = (lowest - context.builder.priority) + 1
+        limit = step * encoder_count // priority_steps
+        if index >= limit:
+            context.builder.priority = context.builder.priority - 1
         _LOGGER.info(
-            "batch size %d: building encoder %d/%d",
+            "batch size %d: building encoder %d/%d with %d priority",
             context.batch_size,
             index + 1,
             len(weights.encoder),
+            context.builder.priority,
         )
         body = _encoder(
             context,
@@ -792,6 +800,7 @@ def _smolgen(  # noqa: PLR0913
 ) -> tuple[Buffer, int]:
     """Build local Smolgen compression and its two normalized dense layers."""
     smolgen = encoder.mha.smolgen
+    context.builder.priority = context.builder.priority - 1
     path = f"weights.{prefix[1:]}.mha.smolgen"
     compress_weights, compression_width = _matrix_f16(
         context,
@@ -932,6 +941,7 @@ def _smolgen(  # noqa: PLR0913
             architecture=context.architecture,
         ),
     )
+    context.builder.priority = context.builder.priority + 1
     return generated, generated_width
 
 
@@ -1437,6 +1447,9 @@ def _policy_head(
     """Build the selected vanilla attention-policy branch."""
     policy = weights.policy_heads.vanilla
 
+    """ Policy is preferred because it has the potential to increase latency most. """
+    context.builder.priority = context.builder.priority - 1
+
     embedding_weights_layer = _policy_embedding_layer(weights, "ip_pol_w")
     embedding_bias_layer = _policy_embedding_layer(weights, "ip_pol_b")
     embedding_weights, policy_width = _matrix_f16(
@@ -1588,6 +1601,7 @@ def _policy_head(
         event="/event/policy_done",
         buffer=[output_host],
     )
+    context.builder.priority = context.builder.priority + 1
 
 
 def _value_head(
@@ -1596,7 +1610,7 @@ def _value_head(
     body_width: int,
     winner: net_pb2.Weights.ValueHead,
 ) -> None:
-    """Build the selected winner WDL branch."""
+    """Build the selected winner WDL branch. It uses normal priority."""
     _dense_output_head(
         context,
         body,
@@ -1622,7 +1636,8 @@ def _moves_left_head(
     body_width: int,
     weights: net_pb2.Weights,
 ) -> None:
-    """Build the selected moves-left branch."""
+    """Build the selected moves-left branch. Other heads are preferred."""
+    context.builder.priority = context.builder.priority + 1
     _dense_output_head(
         context,
         body,
@@ -1640,6 +1655,7 @@ def _moves_left_head(
         final_activation="relu",
         event="/event/mlh_done",
     )
+    context.builder.priority = context.builder.priority - 1
 
 
 def _dense_output_head(  # noqa: PLR0913

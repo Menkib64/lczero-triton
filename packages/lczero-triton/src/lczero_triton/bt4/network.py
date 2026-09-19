@@ -731,12 +731,13 @@ def _encoder_tower(
             head_count=weights.headcount,
             shared_smolgen=weights.smolgen_w if _has_smolgen(weights) else None,
         )
+        if index + 2 == encoder_count:
+            context.builder.event_record(
+                event="/event/sleep",
+                buffer=[body],
+            )
     context.builder.event_record(
         event="/event/compute_ordering",
-        buffer=[body],
-    )
-    context.builder.event_record(
-        event="/event/sleep",
         buffer=[body],
     )
     return body

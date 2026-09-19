@@ -1,4 +1,4 @@
 [submodule "lc0"]
 	path = submodules/lc0
-	url = https://github.com/mooskagh/lc0.git
-	branch = master
+	url = https://github.com/Menkib64/lc0.git
+	branch = lc0ex_graph_and_ownership_rework

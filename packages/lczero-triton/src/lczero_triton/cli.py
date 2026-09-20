@@ -26,7 +26,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     _configure_logging()
     _LOGGER.info("loading network %s", arguments.network)
     network = load_network(arguments.network)
-    builder = ExecutableBuilder(io_data_type=lc0ex_pb2.Buffer.DATA_TYPE_F16)
+    builder = ExecutableBuilder(
+        io_data_type=arguments.io_data_type or lc0ex_pb2.Buffer.DATA_TYPE_F16,
+    )
     _LOGGER.info("starting graph construction")
     with _autotune_progress(), redirect_stdout(sys.stderr):
         build(
@@ -92,6 +94,13 @@ def _build_parser() -> argparse.ArgumentParser:
             "inclusive ranges such as 1,2,4-16:2"
         ),
     )
+    graph_parser.add_argument(
+        "--io-data-type",
+        dest="io_data_type",
+        type=_parse_data_type,
+        default="f16",
+        help="data type for input/output buffers (f16 or f32, default: f16)"
+    )
     return parser
 
 
@@ -105,6 +114,15 @@ def _parse_batch_size_expression(value: str) -> list[int]:
         sizes.extend(range(start, stop + 1, int(step or 1)))
     return sizes
 
+def _parse_data_type(value: str) -> lc0ex_pb2.Buffer.DataType:
+    """Parse a data type string into a Buffer.DataType enum."""
+    value = value.lower()
+    if value == "f16":
+        return lc0ex_pb2.Buffer.DATA_TYPE_F16
+    elif value == "f32":
+        return lc0ex_pb2.Buffer.DATA_TYPE_F32
+    else:
+        raise argparse.ArgumentTypeError(f"invalid data type: {value}")
 
 if __name__ == "__main__":
     raise SystemExit(main())

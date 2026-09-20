@@ -46,13 +46,18 @@ def _policy_map_kernel(
         mask=valid_source,
         other=0.0,
     )
-    tl.store(output + offsets, values, mask=valid)
+    out_dtype = output.dtype.element_ty
+    tl.store(output + offsets, values.to(out_dtype), mask=valid)
 
 
 @dataclass(frozen=True, slots=True)
 class PolicyMapSpecialization:
     """Immutable attention-policy gather specialization."""
 
+    output_type: Literal[
+        lc0ex_pb2.Buffer.DATA_TYPE_F32,
+        lc0ex_pb2.Buffer.DATA_TYPE_F16,
+    ]
     batch_size: int
     architecture: int
     input_element_count: int = 4288
@@ -97,7 +102,11 @@ def compile_policy_map(
 ) -> KernelArtifact:
     """Autotune and compile one FP32 attention-policy gather specialization."""
     element_count = specialization.batch_size * specialization.output_element_count
-    output = torch.empty(element_count, dtype=torch.float16, device="cuda")
+    output = torch.empty(
+        element_count,
+        dtype=torch.float16 if specialization.output_type == lc0ex_pb2.Buffer.DATA_TYPE_F16 else torch.float32,
+        device="cuda"
+    )
     input_ = torch.zeros(
         specialization.batch_size * specialization.input_element_count,
         dtype=torch.float16,

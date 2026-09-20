@@ -36,7 +36,7 @@ def _expand_planes_kernel(
     plane = offsets // square_count
     square = offsets % square_count
     mask_values = tl.load(masks + plane, mask=valid, other=0)
-    plane_values = tl.load(values + plane, mask=valid, other=0.0)
+    plane_values = tl.load(values + plane, mask=valid, other=0.0).to(tl.float16)
     is_set = ((mask_values >> square) & 1) != 0
     expanded = tl.where(is_set, plane_values, 0.0)
     tl.store(output + offsets, expanded, mask=valid)
@@ -46,6 +46,10 @@ def _expand_planes_kernel(
 class ExpandPlanesSpecialization:
     """Immutable U64/F32-to-FP16 plane-expansion specialization."""
 
+    input_type: Litteral[
+        lc0ex_pb2.Buffer.DATA_TYPE_f32,
+        lc0ex_pb2.Buffer.DATA_TYPE_f16,
+    ]
     plane_count: int
     architecture: int
     square_count: int = 64
@@ -87,7 +91,7 @@ def compile_expand_planes(
     )
     values = torch.zeros(
         specialization.plane_count,
-        dtype=torch.float16,
+        dtype=torch.float16 if specialization.input_type == lc0ex_pb2.Buffer.DATA_TYPE_F16 else torch.float32,
         device="cuda",
     )
     compiled = _expand_planes_kernel[_autotune_grid](

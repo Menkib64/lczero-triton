@@ -516,13 +516,14 @@ def _embedding(
         context,
         element_count=plane_count * _SQUARE_COUNT,
     )
+    input_type=context.builder.io_data_type
     expand_planes(
         context.builder,
         context.kernels,
         planes,
         masks,
         values,
-        ExpandPlanesSpecialization(plane_count, context.architecture),
+        ExpandPlanesSpecialization(input_type, plane_count, context.architecture),
     )
 
     position_input = _temporary_f16(
@@ -1589,13 +1590,14 @@ def _policy_head(
     mapping = context.builder.add_symbol(
         compile_symbol(architecture=f"sm_{context.architecture}")
     )
+    output_type=context.builder.io_data_type
     policy_map(
         context.builder,
         context.kernels,
         output,
         records,
         mapping,
-        PolicyMapSpecialization(context.batch_size, context.architecture),
+        PolicyMapSpecialization(output_type, context.batch_size, context.architecture),
     )
     context.builder.memcpy(dst=output_host,src=output)
     context.builder.event_record(
@@ -1764,7 +1766,7 @@ def _dense_output_head(  # noqa: PLR0913
             activation="mish",
         ),
         bias=hidden_bias,
-    )
+)
     matmul(
         context.builder,
         context.kernels,
@@ -1778,6 +1780,7 @@ def _dense_output_head(  # noqa: PLR0913
             context.architecture,
             has_bias=True,
             activation=final_activation,
+            output_f32=context.builder.io_data_type == lc0ex_pb2.Buffer.DATA_TYPE_F32
         ),
         bias=result_bias,
     )

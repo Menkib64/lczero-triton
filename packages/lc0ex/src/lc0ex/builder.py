@@ -300,13 +300,14 @@ class ProgramBuilder:
             raise ValueError("Memcpy between two device buffers is not allowed.")
         """Append a memcpy operation to this program."""
         deps = tuple(dep for dep in deps if isinstance(dep, Buffer))
+        readonly = frozenset(set(src) | set(deps))
         self._invocations.append(
             _MemcpyInvocation(
                 priority=self._priority,
                 dst=dst,
                 src=src,
                 arguments=(dst, src) + deps,
-                readonly=frozenset({tuple(src) + deps})
+                readonly=readonly
             ),
         )
 
@@ -322,7 +323,7 @@ class ProgramBuilder:
                 priority=self._priority,
                 event=event,
                 arguments=arguments,
-                readonly=frozenset(buffer),
+                readonly=frozenset(set(buffer)),
             ),
         )
 
@@ -740,7 +741,7 @@ class ExecutableBuilder:
 
     def _invocation_dependencies(
         self,
-        invocation: _KernelInvocation,
+        invocation: _KernelInvocation | _MemcpyInvocation | _EventRecordInvocation | _EventWaitInvocation,
         index: int,
         writes: list[tuple[Buffer, int, int, int]],
         reads: list[tuple[Buffer, int, int, int]],

@@ -1527,7 +1527,7 @@ def _policy_head(
         writable=True,
     )
 
-    context.builder.memcpy(dst=mapping, src=mapping_host, deps=[body])
+    context.builder.memcpy(dst=mapping, src=mapping_host)
 
     token_rows = context.batch_size * _SQUARE_COUNT
     embedded = _temporary_f16(context, element_count=token_rows * policy_width)

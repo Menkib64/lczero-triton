@@ -28,6 +28,7 @@ def data_type_size_bytes(dtype: lc0ex_pb2.Buffer.DataType) -> int:
     """
     sizes = {
         lc0ex_pb2.Buffer.DATA_TYPE_F32: 4,
+        lc0ex_pb2.Buffer.DATA_TYPE_U32: 4,
         lc0ex_pb2.Buffer.DATA_TYPE_U8: 1,
         lc0ex_pb2.Buffer.DATA_TYPE_F16: 2,
         lc0ex_pb2.Buffer.DATA_TYPE_U64: 8,

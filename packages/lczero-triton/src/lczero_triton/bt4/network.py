@@ -1506,17 +1506,28 @@ def _policy_head(
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
         alignment_bytes=256,
     )
+    mapping = context.builder.buffer(
+        name="/input/policy_mapping",
+        shape=(context.batch_size, 218),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_U32,
+    )
+    mapping_host = context.builder.host_buffer(
+        shape=(context.batch_size, 218),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_U32,
+    )
     output = context.builder.buffer(
         name="/output/policy",
-        shape=(context.batch_size, 1858),
+        shape=(context.batch_size, 218),
         dtype=context.builder.io_data_type,
         writable=True,
     )
     output_host = context.builder.host_buffer(
-        shape=(context.batch_size, 1858),
+        shape=(context.batch_size, 218),
         dtype=context.builder.io_data_type,
         writable=True,
     )
+
+    context.builder.memcpy(dst=mapping, src=mapping_host, deps=[body])
 
     token_rows = context.batch_size * _SQUARE_COUNT
     embedded = _temporary_f16(context, element_count=token_rows * policy_width)
@@ -1586,9 +1597,6 @@ def _policy_head(
         PromotionLogitsSpecialization(
             context.batch_size, model_width, context.architecture
         ),
-    )
-    mapping = context.builder.add_symbol(
-        compile_symbol(architecture=f"sm_{context.architecture}")
     )
     output_type=context.builder.io_data_type
     policy_map(

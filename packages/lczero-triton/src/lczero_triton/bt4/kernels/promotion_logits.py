@@ -168,8 +168,13 @@ def _artifact_grid(
 ) -> tuple[int, int, int]:
     """Resolve the serialized grid from the selected row packing."""
     rows_per_program = cast("int", configuration["rows_per_program"])
-    row_count = batch_size * _PROMOTION_ROW_COUNT
-    return ((row_count + rows_per_program - 1) // rows_per_program, 1, 1)
+    #row_count = batch_size * _PROMOTION_ROW_COUNT
+    return (
+        "(batch_size * %d + %d) / %d" %
+            (_PROMOTION_ROW_COUNT, rows_per_program - 1, rows_per_program),
+        "1",
+        "1",
+    )
 
 
 def compile_promotion_logits(

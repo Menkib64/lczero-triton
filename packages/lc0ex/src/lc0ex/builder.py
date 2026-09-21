@@ -32,7 +32,7 @@ class _KernelInvocation:
 
     priority: int
     kernel: KernelHandle
-    arguments: tuple[Buffer | SymbolHandle, ...]
+    arguments: tuple[Buffer | SymbolHandle | IntHandle, ...]
     readonly: frozenset[Buffer]
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +62,12 @@ class _EventRecordInvocation:
     event: lc0ex_pb2.Node.RecordEvent
     arguments: list[Buffer]
     readonly: frozenset[Buffer]
+
+@dataclass(frozen=True, slots=True)
+class IntHandle:
+    """Gandle for an integer parameter."""
+
+    name: str
 
 class ProgramBuilder:
     """Build one program and its private execution allocation."""
@@ -241,10 +247,14 @@ class ProgramBuilder:
         """Register a symbol in the owning executable."""
         return self._owner.add_symbol(symbol)
 
+    def add_int_parameter(self, name: total_legal_moves) -> IntHandle:
+        """Register an integer parameter and return its handle."""
+        return IntHandle(name)
+
     def call(
         self,
         kernel: KernelHandle,
-        *arguments: Buffer | SymbolHandle,
+        *arguments: Buffer | SymbolHandle | IntHandle,
         readonly: Sequence[Buffer] = (),
     ) -> None:
         """Append a call to this program."""
@@ -282,19 +292,21 @@ class ProgramBuilder:
         self,
         dst: Buffer,
         src: Buffer,
+        deps: Sequence[Buffer] = (),
     ) -> None:
         if dst.is_host() and src.is_host():
             raise ValueError("Memcpy between two host buffers is not allowed.")
         if not dst.is_host() and not src.is_host():
             raise ValueError("Memcpy between two device buffers is not allowed.")
         """Append a memcpy operation to this program."""
+        deps = tuple(dep for dep in deps if isinstance(dep, Buffer))
         self._invocations.append(
             _MemcpyInvocation(
                 priority=self._priority,
                 dst=dst,
                 src=src,
-                arguments=(dst, src),
-                readonly=frozenset({src})
+                arguments=(dst, src) + deps,
+                readonly=frozenset({tuple(src) + deps})
             ),
         )
 
@@ -656,7 +668,7 @@ class ExecutableBuilder:
                     priority=invocation.priority,
                     kernel_idx=kernel_indices[invocation.kernel],
                     dependencies=invocation_dependencies,
-                    grid=artifact.grid,
+                    grid=tuple(str(g) for g in artifact.grid),
                     block=artifact.block,
                     dynamic_shared_memory_bytes=artifact.dynamic_shared_memory_bytes,
                 )
@@ -683,6 +695,12 @@ class ExecutableBuilder:
                             allocation=lc0ex_pb2.Node.Argument.AllocationLocation(
                                 kind=allocation,
                                 offset=location.offset,
+                            )
+                        )
+                    elif isinstance(argument, IntHandle):
+                        node.arguments.add(
+                            parameter=lc0ex_pb2.Node.Argument.Parameter(
+                                name=argument.name,
                             )
                         )
                     else:

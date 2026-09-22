@@ -81,7 +81,7 @@ def _fused_attention_kernel(
 
     # Q @ K^T: (64, block_d) @ (block_d, 64) -> (64, 64)
     k_t = tl.trans(k)
-    qk = tl.dot(q, k_t, out_dtype=tl.float32) * scale
+    qk = tl.dot(q, k_t, out_dtype=tl.float16).to(tl.float32) * scale
 
     # Smolgen addition. `has_smolgen` is a constexpr, so on a net without
     # smolgen the load is not merely skipped at runtime -- it is not compiled,
@@ -113,7 +113,7 @@ def _fused_attention_kernel(
         v = tl.load(v_ptrs).to(tl.float16)
     else:
         v = tl.load(v_ptrs, mask=mask_d[None, :], other=0.0).to(tl.float16)
-    out_val = tl.dot(probs, v, out_dtype=tl.float32).to(tl.float16)
+    out_val = tl.dot(probs, v, out_dtype=tl.float16)
 
     out_head_offset = sample * (_SQUARE_COUNT * model_width) + head * head_depth
     out_ptrs = (

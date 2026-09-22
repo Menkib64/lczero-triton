@@ -115,7 +115,7 @@ def _qk_kernel(
     key_pointers = (
         keys + key_base + offsets_k[:, None] + offsets_n[None, :] * key_row_stride
     )
-    accumulator = tl.zeros((block_m, block_n), dtype=tl.float32)
+    accumulator = tl.zeros((block_m, block_n), dtype=tl.float16)
 
     for k_block in range(tl.cdiv(k, block_k)):
         remaining_k = k - k_block * block_k
@@ -133,7 +133,7 @@ def _qk_kernel(
             & (offsets_n[None, :] < n),
             other=0.0,
         )
-        accumulator = tl.dot(query_values, key_values, accumulator)
+        accumulator = tl.dot(query_values, key_values, accumulator, out_dtype=tl.float16)
         query_pointers += block_k
         key_pointers += block_k
 

@@ -96,7 +96,7 @@ def _promotion_logits_kernel(
         + offsets_k[:, None] * _TRITON_PROMOTION_WEIGHT_COUNT
         + offsets_n[None, :]
     )
-    accumulator = tl.zeros((block_m, 16), dtype=tl.float32)
+    accumulator = tl.zeros((block_m, 16), dtype=tl.float16)
 
     for k_block in range(tl.cdiv(width, block_k)):
         remaining_k = width - k_block * block_k
@@ -111,7 +111,7 @@ def _promotion_logits_kernel(
             & (offsets_n[None, :] < _TRITON_PROMOTION_WEIGHT_COUNT),
             other=0.0,
         )
-        accumulator = tl.dot(key_values, weight_values, accumulator)
+        accumulator = tl.dot(key_values, weight_values, accumulator, out_dtype=tl.float16)
         key_pointers += block_k
         weight_pointers += block_k * _TRITON_PROMOTION_WEIGHT_COUNT
 
@@ -127,7 +127,7 @@ def _promotion_logits_kernel(
             + _TRITON_PROMOTION_INPUT_START
             + destination_files
         )
-        qk_values = tl.load(qk_pointers, mask=valid_rows, other=0.0).to(tl.float32)
+        qk_values = tl.load(qk_pointers, mask=valid_rows, other=0.0)
         for channel in range(_TRITON_PROMOTION_OUTPUT_COUNT):
             channel_offsets = tl.sum(
                 tl.where(offsets_n[None, :] == channel, accumulator, 0.0),

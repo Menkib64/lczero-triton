@@ -67,7 +67,7 @@ class _EventRecordInvocation:
 class IntHandle:
     """Gandle for an integer parameter."""
 
-    name: str
+    formula: str
 
 class ProgramBuilder:
     """Build one program and its private execution allocation."""
@@ -247,9 +247,9 @@ class ProgramBuilder:
         """Register a symbol in the owning executable."""
         return self._owner.add_symbol(symbol)
 
-    def add_int_parameter(self, name: total_legal_moves) -> IntHandle:
+    def add_int_parameter(self, formula: str) -> IntHandle:
         """Register an integer parameter and return its handle."""
-        return IntHandle(name)
+        return IntHandle(formula)
 
     def call(
         self,
@@ -700,9 +700,7 @@ class ExecutableBuilder:
                         )
                     elif isinstance(argument, IntHandle):
                         node.arguments.add(
-                            parameter=lc0ex_pb2.Node.Argument.Parameter(
-                                name=argument.name,
-                            )
+                            parameter=argument.formula,
                         )
                     else:
                         binary_idx, symbol_name = symbol_locations[argument]

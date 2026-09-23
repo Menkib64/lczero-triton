@@ -45,15 +45,15 @@ def _add_vectors_kernel(
 ) -> None:
     offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
     valid = offsets < element_count
-    values = tl.load(input_ + offsets, mask=valid, other=0.0).to(tl.float32)
+    values = tl.load(input_ + offsets, mask=valid, other=0.0)
     biases = tl.load(
         bias + offsets % bias_element_count,
         mask=valid,
         other=0.0,
-    ).to(tl.float32)
+    )
     values += biases
     if activation == _ACTIVATION_MISH:
-        exponential = tl.exp(values)
+        exponential = tl.exp(values.to(tl.float32))
         numerator = exponential * exponential + 2.0 * exponential
         division = values / (numerator + 2.0)
         values = tl.where(

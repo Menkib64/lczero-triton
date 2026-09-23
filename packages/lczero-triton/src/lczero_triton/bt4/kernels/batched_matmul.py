@@ -139,7 +139,7 @@ def _qk_kernel(
 
     output_pointers = output + output_base + offsets_m[:, None] * n + offsets_n[None, :]
     output_mask = matrix_valid & (offsets_m[:, None] < m) & (offsets_n[None, :] < n)
-    scale_value = tl.load(scale).to(tl.float32)
+    scale_value = tl.load(scale)
     tl.store(output_pointers, accumulator * scale_value, mask=output_mask)
 
 
@@ -184,7 +184,7 @@ def _attention_v_kernel(
     value_pointers = (
         values + value_base + offsets_k[:, None] * value_width + offsets_n[None, :]
     )
-    accumulator = tl.zeros((block_m, block_n), dtype=tl.float32)
+    accumulator = tl.zeros((block_m, block_n), dtype=tl.float16)
 
     for k_block in range(tl.cdiv(k, block_k)):
         remaining_k = k - k_block * block_k

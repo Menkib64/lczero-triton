@@ -274,20 +274,20 @@ def _matmul_kernel(  # noqa: C901, PLR0912, PLR0915
             activation_pointers += block_k
             weight_pointers += block_k * n
 
-    values = accumulator.to(tl.float32)
+    values = accumulator
     if has_bias:
         if n % block_n == 0:
-            bias_values = tl.load(bias + offsets_n).to(tl.float32)
+            bias_values = tl.load(bias + offsets_n)
         else:
             bias_values = tl.load(
                 bias + offsets_n,
                 mask=offsets_n < n,
                 other=0.0,
-            ).to(tl.float32)
+            )
         values += bias_values[None, :]
 
     if activation == _ACTIVATION_MISH:
-        exponential = tl.exp(values)
+        exponential = tl.exp(values.to(tl.float32))
         numerator = exponential * exponential + 2.0 * exponential
         division = values / (numerator + 2.0)
         values = tl.where(
@@ -298,7 +298,7 @@ def _matmul_kernel(  # noqa: C901, PLR0912, PLR0915
     elif activation == _ACTIVATION_RELU:
         values = tl.maximum(values, 0.0)
     elif activation == _ACTIVATION_SWISH:
-        values = values / (1.0 + tl.exp(-values))
+        values = values / (1.0 + tl.exp(-values.to(tl.float32)))
 
     output_offsets_m = program_m * block_m + tl.arange(0, block_m)
     output_offsets_n = program_n * block_n + tl.arange(0, block_n)
@@ -408,16 +408,16 @@ def _matmul_skip_kernel(  # noqa: C901, PLR0912, PLR0915
             activation_pointers += block_k
             weight_pointers += block_k * n
 
-    values = accumulator.to(tl.float32)
+    values = accumulator
     if has_bias:
         if n % block_n == 0:
-            bias_values = tl.load(bias + offsets_n).to(tl.float32)
+            bias_values = tl.load(bias + offsets_n)
         else:
             bias_values = tl.load(
                 bias + offsets_n,
                 mask=offsets_n < n,
                 other=0.0,
-            ).to(tl.float32)
+            )
         values += bias_values[None, :]
 
     if activation == _ACTIVATION_MISH:
@@ -434,16 +434,16 @@ def _matmul_skip_kernel(  # noqa: C901, PLR0912, PLR0915
     elif activation == _ACTIVATION_SWISH:
         values = values / (1.0 + tl.exp(-values))
 
-    alpha_val = tl.load(alpha).to(tl.float32)
+    alpha_val = tl.load(alpha)
     values = values * alpha_val
     output_offsets_m = program_m * block_m + tl.arange(0, block_m)
     output_offsets_n = program_n * block_n + tl.arange(0, block_n)
     skip_pointers = skip + output_offsets_m[:, None] * n + output_offsets_n[None, :]
     if m % block_m == 0 and n % block_n == 0:
-        skip_values = tl.load(skip_pointers).to(tl.float32)
+        skip_values = tl.load(skip_pointers)
     else:
         skip_mask = (output_offsets_m[:, None] < m) & (output_offsets_n[None, :] < n)
-        skip_values = tl.load(skip_pointers, mask=skip_mask, other=0.0).to(tl.float32)
+        skip_values = tl.load(skip_pointers, mask=skip_mask, other=0.0)
     values = values + skip_values
 
     output_pointers = output + output_offsets_m[:, None] * n + output_offsets_n[None, :]

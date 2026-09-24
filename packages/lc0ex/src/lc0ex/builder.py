@@ -1,5 +1,7 @@
 """Builder for serialized Lc0 neural executables."""
 
+import json
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from os import PathLike
@@ -23,6 +25,11 @@ from lc0ex.proto import lc0ex_pb2
 
 _MAGIC = 0x1C0E
 _FORMAT = 1
+# Round 26 C1 (the bytes census): when set, every `ProgramBuilder.call` appends one JSON line to this file -- the
+# kernel, its grid, and per argument the byte span it can touch and whether the call may write it. The artifact
+# itself records only allocation offsets, so this is the only place a node's IDEAL bytes (each input read once,
+# each output written once) can be read from. Off by default; the artifact is identical either way.
+_TRACE_CALLS = os.environ.get("LC0EX_TRACE_CALLS", "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +207,9 @@ class ProgramBuilder:
                 ),
             ),
         )
+        if _TRACE_CALLS:
+            self._owner._trace_call(self._name, len(self._invocations) - 1, artifact,  # noqa: SLF001
+                                    self._invocations[-1])
 
 
 class ExecutableBuilder:
@@ -511,6 +521,27 @@ class ExecutableBuilder:
                             symbol_name=symbol_name,
                         )
                     )
+
+    def _trace_call(self, program: str, index: int, artifact: KernelArtifact, invocation: _KernelInvocation) -> None:
+        """Append one call's argument spans to `LC0EX_TRACE_CALLS` (round 26 C1)."""
+        entries = []
+        for argument in invocation.arguments:
+            if not isinstance(argument, Buffer):
+                entries.append({"kind": "symbol"})
+                continue
+            root, low, high = self._hazard_range(argument)
+            record = self._buffers._records[root]  # noqa: SLF001
+            external = record.external
+            entries.append({
+                "root": id(root), "low": low, "high": high, "bytes": high - low,
+                "persistent": record.allocation.is_persistent(),
+                "readonly": argument in invocation.readonly,
+                "name": getattr(external, "name", None) if external is not None else None,
+            })
+        line = {"program": program, "index": index, "function": artifact.function, "grid": list(artifact.grid),
+                "arguments": entries}
+        with Path(_TRACE_CALLS).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(line) + "\n")
 
     def _hazard_range(self, buffer: Buffer) -> tuple[Buffer, int, int]:
         """Return the (root storage, first byte, last byte + 1) a buffer touches.

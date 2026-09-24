@@ -8,6 +8,9 @@ slots, CUDA-graph mode, the `multi` backend, `backendcompare`) is a matching bra
 
 All numbers below were measured on an **RTX 4090 (sm_89, 128 SM, 72 MB L2)**.
 
+**Lab research nets** (static, EGT2 gcap / triplet, the BT6-test sponsor shape) are built by a second front end,
+`lczero_triton.lab`, from the ONNX the lab exports: see **`LC0EX_LAB_NETS.md`**.
+
 ## What is in the branch
 
 | file | what it does |

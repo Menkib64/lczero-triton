@@ -1,5 +1,6 @@
 """Shared launch candidates for BT4 autotuning."""
 
+import weakref
 from typing import cast
 
 import torch
@@ -49,8 +50,9 @@ def active_architecture() -> int:
 
 
 _MAX_HOST_MIRRORS = 64
+_MirrorEntry = tuple["weakref.ReferenceType[torch.Tensor]", torch.Tensor]
 _HOST_MIRROR_CACHE: dict[
-    tuple[int, tuple[int, ...], torch.dtype, tuple[int, ...]], torch.Tensor
+    tuple[int, tuple[int, ...], torch.dtype, tuple[int, ...]], _MirrorEntry
 ] = {}
 
 
@@ -149,9 +151,12 @@ def cold_do_bench(
     host_mirrors: list[torch.Tensor] = []
     for t in gpu_tensors:
         key = (t.data_ptr(), tuple(t.shape), t.dtype, tuple(t.stride()))
-        if key not in _HOST_MIRROR_CACHE:
-            _HOST_MIRROR_CACHE[key] = t.detach().cpu().pin_memory()
-        host_mirrors.append(_HOST_MIRROR_CACHE[key])
+        entry = _HOST_MIRROR_CACHE.get(key)
+        # The allocator reuses addresses: an entry is valid only while the SAME tensor object owns it.
+        if entry is None or entry[0]() is not t:
+            entry = (weakref.ref(t), t.detach().cpu().pin_memory())
+            _HOST_MIRROR_CACHE[key] = entry
+        host_mirrors.append(entry[1])
 
     for _ in range(warmup):
         fn()

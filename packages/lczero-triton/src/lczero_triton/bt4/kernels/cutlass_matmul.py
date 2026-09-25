@@ -26,6 +26,7 @@ from lc0ex import Buffer, KernelArtifact, ProgramBuilder
 from lc0ex.cubin_module_compiler import artifact_from_cubin, compile_cuda
 from lc0ex.proto import lc0ex_pb2
 
+from lczero_triton.bt4.kernels._activation import SOFTCAP_UNIT_SERIES_MIN
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 _LOGGER = logging.getLogger(__name__)
@@ -316,6 +317,13 @@ class CutlassMatmulSpecialization:
     # Fuses `D = act(Acc + bias) * alpha + skip`, which is what wip-20260825's
     # `_matmul_skip_kernel` computes for the encoder out-projection and FFN2.
     has_skip: bool = False
+    # Round 20b P2: sigmoid(x @ W_gate + b_gate) * (x @ W_up + b_up) from one [k, 2n]
+    # weight matrix as a dual GEMM; requires has_bias (the [2n] gate|up bias).
+    glu: bool = False
+    # BT6-test (09-21): the lab's `ffn_softcap` on the sigmoid GLU -- both branches pass
+    # through c*tanh(./c) before the product (`_activation` gate "glu_capped"). 0 = off,
+    # and then the rendered source is byte-identical to the uncapped family's.
+    glu_softcap: float = 0.0
 
 
 def _select_tile(
@@ -386,6 +394,10 @@ def entry_point_name(specialization: CutlassMatmulSpecialization) -> str:
         suffix += "_bias"
     if specialization.activation != "none":
         suffix += f"_{specialization.activation}"
+    if specialization.glu:
+        suffix += "_glu"
+        if specialization.glu_softcap > 0.0:
+            suffix += "_cap" + f"{specialization.glu_softcap:g}".replace(".", "p").replace("-", "m").replace("+", "")
     if specialization.has_skip:
         suffix += "_skip"
     return (
@@ -589,7 +601,9 @@ _BIAS_ITERATOR = """  typename Epilogue::OutputTileIterator iterator_bias(
 
 
 def _epilogue_family(specialization: CutlassMatmulSpecialization) -> str:
-    """Name the epilogue this specialization needs: plain, fused or residual."""
+    """Name the epilogue this specialization needs: plain, fused, residual or glu."""
+    if specialization.glu:
+        return "glu"
     if specialization.has_skip:
         return "residual"
     if specialization.has_bias or specialization.activation != "none":
@@ -609,6 +623,11 @@ def _render(
     """
     threadblock, warp, stages = tile or _select_tile(specialization)
     family = _epilogue_family(specialization)
+    if family == "glu":
+        if not specialization.has_bias or specialization.has_skip:
+            message = "the glu family takes a [2n] bias and no skip"
+            raise ValueError(message)
+        template = _GLU_TEMPLATES.get(id(template), template)
     if family == "residual":
         parameters = ", const ElementC* bias" if specialization.has_bias else ""
         parameters += ", const ElementC* skip, const ElementC* alpha"
@@ -652,7 +671,56 @@ def _render(
         threads=_thread_count(threadblock, warp),
         entry=entry_point_name(specialization),
         sweep_arguments=_sweep_arguments(specialization),
+        b_columns="2 * kN" if specialization.glu else "kN",
+        bias_count="2 * kN" if specialization.glu else "kN",
+        glu_include=str(_GLU_EXAMPLE),
+        **_glu_softcap_fields(specialization),
     )
+
+
+_GLU_SOFTCAP_DECL = """// BT6-test `ffn_softcap`: c * tanh(x / c) in the two-sided exponential form of the Triton
+// lowering (`_activation._softcap`), so both routes stay in one fidelity class.
+constexpr float kGluSoftcap = {cap!r}f;
+CUTLASS_HOST_DEVICE float lc0_glu_softcap(float x) {{
+  const float magnitude = LC0_DIV(x < 0.0f ? -x : x, kGluSoftcap);
+  const float decay = LC0_EXP(-2.0f * magnitude);
+  const float tangent = LC0_DIV(1.0f - decay, 1.0f + decay);
+  return kGluSoftcap * (x < 0.0f ? -tangent : tangent);
+}}
+// The gate is a sigmoid, so it lies in (0, 1): `_activation._softcap_unit`, the same rule and the same bound.
+CUTLASS_HOST_DEVICE float lc0_glu_softcap_unit(float g) {{
+{unit_body}
+}}
+"""
+_GLU_SOFTCAP_UNIT_SERIES = """  const float ratio = g * (1.0f / kGluSoftcap);
+  const float square = ratio * ratio;
+  return g * (1.0f - square * ((1.0f / 3.0f) - square * (2.0f / 15.0f)));"""
+_GLU_SOFTCAP_UNIT_GENERAL = "  return lc0_glu_softcap(g);"
+
+
+def _glu_softcap_fields(specialization: CutlassMatmulSpecialization) -> dict[str, str]:
+    """The four template fields of the GLU functor; with no cap they render the uncapped source unchanged."""
+    cap = float(specialization.glu_softcap)
+    if cap < 0.0 or cap != cap or cap == float("inf"):
+        message = f"glu_softcap must be a finite value >= 0 (0 = off); got {cap}"
+        raise ValueError(message)
+    if cap > 0.0 and not specialization.glu:
+        message = "glu_softcap caps the two GLU branches; it needs glu=True"
+        raise ValueError(message)
+    if cap == 0.0:
+        return {
+            "glu_softcap_decl": "",
+            "glu_gate_expr": "gate",
+            "glu_up_expr_i": "static_cast<float>(rhs[i])",
+            "glu_up_expr": "static_cast<float>(rhs)",
+        }
+    unit_body = _GLU_SOFTCAP_UNIT_SERIES if cap >= SOFTCAP_UNIT_SERIES_MIN else _GLU_SOFTCAP_UNIT_GENERAL
+    return {
+        "glu_softcap_decl": _GLU_SOFTCAP_DECL.format(cap=cap, unit_body=unit_body),
+        "glu_gate_expr": "lc0_glu_softcap_unit(gate)",
+        "glu_up_expr_i": "lc0_glu_softcap(static_cast<float>(rhs[i]))",
+        "glu_up_expr": "lc0_glu_softcap(static_cast<float>(rhs))",
+    }
 
 
 def _sweep_arguments(specialization: CutlassMatmulSpecialization) -> str:
@@ -685,8 +753,8 @@ int main() {{
   void* alpha = nullptr;
   if (cudaMalloc(&d, (size_t)kM * kN * sizeof(ElementC)) != cudaSuccess ||
       cudaMalloc(&a, (size_t)kM * kK * sizeof(ElementA)) != cudaSuccess ||
-      cudaMalloc(&b, (size_t)kK * kN * sizeof(ElementB)) != cudaSuccess ||
-      cudaMalloc(&bias, (size_t)kN * sizeof(ElementC)) != cudaSuccess ||
+      cudaMalloc(&b, (size_t)kK * {b_columns} * sizeof(ElementB)) != cudaSuccess ||
+      cudaMalloc(&bias, (size_t){bias_count} * sizeof(ElementC)) != cudaSuccess ||
       cudaMalloc(&skip, (size_t)kM * kN * sizeof(ElementC)) != cudaSuccess ||
       cudaMalloc(&alpha, sizeof(ElementC)) != cudaSuccess) {{
     std::printf("-1\n");
@@ -694,8 +762,8 @@ int main() {{
   }}
   cudaMemset(d, 0, (size_t)kM * kN * sizeof(ElementC));
   cudaMemset(a, 0, (size_t)kM * kK * sizeof(ElementA));
-  cudaMemset(b, 0, (size_t)kK * kN * sizeof(ElementB));
-  cudaMemset(bias, 0, (size_t)kN * sizeof(ElementC));
+  cudaMemset(b, 0, (size_t)kK * {b_columns} * sizeof(ElementB));
+  cudaMemset(bias, 0, (size_t){bias_count} * sizeof(ElementC));
   cudaMemset(skip, 0, (size_t)kM * kN * sizeof(ElementC));
   cudaMemset(alpha, 0, sizeof(ElementC));
 
@@ -740,6 +808,193 @@ int main() {{
 
 _SWEEP_TEMPLATE = _KERNEL_TEMPLATE + _SWEEP_MAIN
 
+
+# ---------------------------------------------------------------------------
+# The `glu` family (round 20b P2): sigmoid(x @ Wg + bg) * (x @ Wu + bu) as one
+# CUTLASS dual GEMM (examples/45_dual_gemm). See `CutlassMatmulSpecialization.glu`.
+_LC0ACT_MARKER = "}}  // namespace lc0act\n"
+_LC0ACT_HEAD = _TYPES_TEMPLATE[: _TYPES_TEMPLATE.index(_LC0ACT_MARKER) + len(_LC0ACT_MARKER)]
+_GLU_EXAMPLE = CUTLASS_INCLUDE.parent / "examples" / "45_dual_gemm"
+
+_GLU_TYPES_TEMPLATE = _LC0ACT_HEAD + """
+#include "{glu_include}/threadblock/dual_mma_multistage.h"
+#include "{glu_include}/threadblock/dual_epilogue.h"
+
+namespace {{
+
+using ElementA = cutlass::half_t;
+using ElementB = cutlass::half_t;
+using ElementC = cutlass::half_t;
+using ElementAccumulator = cutlass::half_t;
+using ElementCompute = float;
+using LayoutA = cutlass::layout::RowMajor;
+using LayoutB = cutlass::layout::RowMajor;
+using LayoutC = cutlass::layout::RowMajor;
+
+constexpr int kM = {m};
+constexpr int kN = {n};
+constexpr int kK = {k};
+
+using ThreadblockShape = cutlass::gemm::GemmShape<{tile_m}, {tile_n}, {tile_k}>;
+using WarpShape = cutlass::gemm::GemmShape<{warp_m}, {warp_n}, {warp_k}>;
+using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+
+using GluMma = typename cutlass::gemm::threadblock::DefaultMma<
+    ElementA, LayoutA, 8, ElementB, LayoutB, 8,
+    ElementAccumulator, LayoutC,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    ThreadblockShape, WarpShape, InstructionShape, {stages},
+    cutlass::arch::OpMultiplyAdd>::ThreadblockMma;
+
+// D = accumulator + bias in FP32, the fused family's NoBetaScaling form with the
+// identity activation.
+using GluOp0 = cutlass::epilogue::thread::LinearCombinationGeneric<
+    lc0act::Op, ElementC, 128 / cutlass::sizeof_bits<ElementC>::value,
+    ElementAccumulator, ElementCompute,
+    cutlass::epilogue::thread::ScaleType::NoBetaScaling>;
+
+// sigmoid(gate) * up, the lab's GLU (`_activation.apply_glu`, gate "glu"), written with
+// the same fast exp/div pair as the Triton lowering.
+{glu_softcap_decl}struct Lc0SigmoidAndMul {{
+  using ElementOutput = ElementC;
+  using ElementAccumulator = ElementC;
+  using ElementCompute = float;
+  static int const kCount = 128 / cutlass::sizeof_bits<ElementC>::value;
+  using FragmentOutput = cutlass::Array<ElementOutput, kCount>;
+  using FragmentAccumulator = cutlass::Array<ElementAccumulator, kCount>;
+  struct Params {{}};
+  CUTLASS_HOST_DEVICE explicit Lc0SigmoidAndMul(Params const&) {{}}
+  CUTLASS_HOST_DEVICE bool is_source_needed() const {{ return true; }}
+  CUTLASS_HOST_DEVICE void set_k_partition(int, int) {{}}
+  CUTLASS_HOST_DEVICE
+  FragmentOutput operator()(FragmentAccumulator const& lhs, FragmentAccumulator const& rhs) const {{
+    FragmentOutput out;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kCount; ++i) {{
+      const float gate = LC0_DIV(1.0f, 1.0f + LC0_EXP(-static_cast<float>(lhs[i])));
+      out[i] = ElementOutput({glu_gate_expr} * {glu_up_expr_i});
+    }}
+    return out;
+  }}
+  CUTLASS_HOST_DEVICE
+  ElementOutput operator()(ElementAccumulator const& lhs, ElementAccumulator const& rhs) const {{
+    const float gate = LC0_DIV(1.0f, 1.0f + LC0_EXP(-static_cast<float>(lhs)));
+    return ElementOutput({glu_gate_expr} * {glu_up_expr});
+  }}
+}};
+
+}}  // namespace
+
+// Resolved inside cutlass::gemm / cutlass::epilogue exactly as the example's own
+// device header resolves them (threadblock::, SharedMemoryClearOption).
+namespace cutlass {{ namespace gemm {{ namespace lc0glu {{
+using DualMma = threadblock::DualMmaMultistage<
+    typename GluMma::Shape,
+    typename GluMma::IteratorA, typename GluMma::SmemIteratorA, GluMma::kCacheOpA,
+    typename GluMma::IteratorB, typename GluMma::SmemIteratorB, GluMma::kCacheOpB,
+    typename GluMma::IteratorB, typename GluMma::SmemIteratorB,
+    typename GluMma::ElementC, typename GluMma::LayoutC,
+    typename GluMma::Policy, typename GluMma::Policy,
+    GluMma::kStages, SharedMemoryClearOption::kNone>;
+}} }} }}
+
+namespace cutlass {{ namespace epilogue {{ namespace lc0glu {{
+static int const kPartitionsK = ThreadblockShape::kK / WarpShape::kK;
+using Epilogue0 = typename threadblock::DefaultEpilogueTensorOp<
+    ThreadblockShape, typename cutlass::gemm::lc0glu::DualMma::Operator0, kPartitionsK,
+    GluOp0, GluOp0::kCount>::Epilogue;
+using DualEpilogue = threadblock::DualEpilogue<
+    typename Epilogue0::Shape,
+    typename Epilogue0::WarpMmaOperator,
+    Epilogue0::kPartitionsK,
+    typename Epilogue0::OutputTileIterator,
+    typename Epilogue0::AccumulatorFragmentIterator,
+    typename Epilogue0::WarpTileIterator,
+    typename Epilogue0::SharedLoadIterator,
+    GluOp0, GluOp0, Lc0SigmoidAndMul,
+    typename Epilogue0::Padding,
+    false, false,
+    Epilogue0::kFragmentsPerIteration,
+    true>;
+}} }} }}
+
+namespace {{
+union SharedStorage {{
+  typename cutlass::gemm::lc0glu::DualMma::SharedStorage main_loop;
+  typename cutlass::epilogue::lc0glu::DualEpilogue::SharedStorage epilogue;
+}};
+}}  // namespace
+"""
+
+_GLU_PROBE_TEMPLATE = _GLU_TYPES_TEMPLATE + _PROBE_TEMPLATE[len(_TYPES_TEMPLATE):]
+
+_GLU_KERNEL_TEMPLATE = _GLU_TYPES_TEMPLATE + """
+extern "C" __global__ __launch_bounds__({threads}) void {entry}(
+    ElementC* d, const ElementA* a, const ElementB* b, const ElementC* bias) {{
+  extern __shared__ char lc0ex_shared_base[];
+  SharedStorage& shared = *reinterpret_cast<SharedStorage*>(lc0ex_shared_base);
+  using DualMma = cutlass::gemm::lc0glu::DualMma;
+  using DualEpilogue = cutlass::epilogue::lc0glu::DualEpilogue;
+  using OutputIterator = typename cutlass::epilogue::lc0glu::Epilogue0::OutputTileIterator;
+
+  const int tile_row = blockIdx.x;
+  const int tile_column = blockIdx.y;
+  if (tile_row * ThreadblockShape::kM >= kM) return;
+  if (tile_column * ThreadblockShape::kN >= kN) return;
+
+  const cutlass::MatrixCoord offset_a{{tile_row * ThreadblockShape::kM, 0}};
+  const cutlass::MatrixCoord offset_b{{0, tile_column * ThreadblockShape::kN}};
+  const int k_iterations = (kK + ThreadblockShape::kK - 1) / ThreadblockShape::kK;
+
+  // One [K, 2N] row-major weight matrix, gate columns first: both operands step
+  // rows by 2N, and the up operand starts N columns in.
+  typename DualMma::IteratorA iterator_a(
+      typename DualMma::IteratorA::Params(LayoutA(kK)),
+      const_cast<ElementA*>(a), {{kM, kK}}, threadIdx.x, offset_a);
+  typename DualMma::IteratorB0 iterator_gate(
+      typename DualMma::IteratorB0::Params(LayoutB(2 * kN)),
+      const_cast<ElementB*>(b), {{kK, kN}}, threadIdx.x, offset_b);
+  typename DualMma::IteratorB1 iterator_up(
+      typename DualMma::IteratorB1::Params(LayoutB(2 * kN)),
+      const_cast<ElementB*>(b + kN), {{kK, kN}}, threadIdx.x, offset_b);
+
+  const int warp_index = threadIdx.x / 32;
+  const int lane_index = threadIdx.x % 32;
+
+  typename DualMma::FragmentC gate_accumulators;
+  typename DualMma::FragmentC up_accumulators;
+  gate_accumulators.clear();
+  up_accumulators.clear();
+  DualMma mma(shared.main_loop, threadIdx.x, warp_index, lane_index);
+  mma(k_iterations, gate_accumulators, up_accumulators, iterator_a, iterator_gate, iterator_up,
+      gate_accumulators, up_accumulators);
+
+  GluOp0 bias_op(typename GluOp0::Params(ElementCompute(1), ElementCompute(1)));
+  Lc0SigmoidAndMul gate_op{{typename Lc0SigmoidAndMul::Params()}};
+  const cutlass::MatrixCoord offset_d{{tile_row * ThreadblockShape::kM,
+                                     tile_column * ThreadblockShape::kN}};
+  OutputIterator iterator_d(typename OutputIterator::Params(LayoutC(kN)), d,
+                            {{kM, kN}}, threadIdx.x, offset_d);
+  OutputIterator iterator_gate_bias(typename OutputIterator::Params(LayoutC(0)),
+                                    const_cast<ElementC*>(bias), {{kM, kN}}, threadIdx.x, offset_d);
+  OutputIterator iterator_up_bias(typename OutputIterator::Params(LayoutC(0)),
+                                  const_cast<ElementC*>(bias + kN), {{kM, kN}}, threadIdx.x, offset_d);
+  OutputIterator sources[2] = {{iterator_gate_bias, iterator_up_bias}};
+  DualEpilogue epilogue(shared.epilogue, threadIdx.x, warp_index, lane_index);
+  // D0 and D1 are not stored (kStoreD0 = kStoreD1 = false); only D2 reaches `d`.
+  epilogue(bias_op, bias_op, gate_op, iterator_d, iterator_d, iterator_d,
+           gate_accumulators, up_accumulators, sources, true);
+}}
+"""
+
+_GLU_SWEEP_TEMPLATE = _GLU_KERNEL_TEMPLATE + _SWEEP_MAIN
+
+_GLU_TEMPLATES = {
+    id(_KERNEL_TEMPLATE): _GLU_KERNEL_TEMPLATE,
+    id(_PROBE_TEMPLATE): _GLU_PROBE_TEMPLATE,
+    id(_SWEEP_TEMPLATE): _GLU_SWEEP_TEMPLATE,
+}
+
 # The candidates worth trying on an unknown device: every tile the sm_89 sweep
 # ever chose, plus the narrow and wide ends, since the wave count -- and so the
 # winner -- moves with the SM count.
@@ -764,21 +1019,79 @@ _SWEEP_CACHE_PATH = Path(
 )
 
 
-def _load_sweep_cache() -> dict[str, list[object]]:
+# One process has to resolve one specialization to ONE tile. `_select_tile` is
+# consulted three times for a single kernel -- when the dynamic shared memory is
+# probed (`shared_storage_bytes`), when the body is rendered (`_render`) and again
+# in `compile_cutlass_matmul` for the launch grid -- so reopening the file at each
+# of those lets a concurrent builder's rewrite land between them. Round 22 built
+# two ladders beside a third build against one shared JSON and compiled a rung-8
+# QKV GEMM for one tile while launching it with another's shared memory: every
+# rung gated clean and every backendbench batch died on an invalid __shared__
+# write. The file is therefore read once per process and per path, and a sweep
+# this process ran outranks anything that appears on disk afterwards -- the tile
+# it compiled for is the tile it must launch.
+_SWEEP_CACHE_MEMO: dict[Path, dict[str, list[object]]] = {}
+# What THIS process measured, so a store can merge onto a file other builders
+# have written to since, without ever adopting their answer for our own shapes.
+_SWEEP_CACHE_OWN: dict[str, object] = {}
+
+
+def _read_sweep_cache_file() -> dict[str, list[object]]:
     """Read the on-disk sweep results, tolerating a missing or corrupt file."""
     try:
-        return json.loads(_SWEEP_CACHE_PATH.read_text(encoding="utf-8"))
+        loaded = json.loads(_SWEEP_CACHE_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _load_sweep_cache() -> dict[str, list[object]]:
+    """Return this process's view of the sweep cache, read from disk once.
+
+    The memo is keyed on the path, so pointing `LC0EX_CUTLASS_TILE_CACHE` at
+    another file still takes effect; only a rewrite of the file this process is
+    already using is ignored, which is exactly the race.
+    """
+    cache = _SWEEP_CACHE_MEMO.get(_SWEEP_CACHE_PATH)
+    if cache is None:
+        cache = _read_sweep_cache_file()
+        _SWEEP_CACHE_MEMO.clear()
+        _SWEEP_CACHE_MEMO[_SWEEP_CACHE_PATH] = cache
+    return cache
+
+
+def _replace_sweep_cache_file(cache: dict[str, object]) -> None:
+    """Write the cache beside the target and rename it on, so readers see one state."""
+    temporary = _SWEEP_CACHE_PATH.with_name(f"{_SWEEP_CACHE_PATH.name}.{os.getpid()}.tmp")
+    try:
+        # O_CREAT respects the umask, and an existing cache keeps the mode it had:
+        # `mkstemp` would hand back at 0600 a file that several builds -- and, on a
+        # shared box, several users -- have always been able to read.
+        descriptor = os.open(temporary, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o666)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(cache, indent=1))
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.chmod(temporary, _SWEEP_CACHE_PATH.stat().st_mode & 0o777)
+        except OSError:
+            pass
+        os.replace(temporary, _SWEEP_CACHE_PATH)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _store_sweep_result(key: str, tile: object) -> None:
-    """Add one measured tile to the on-disk cache."""
+    """Add one measured tile to this process's view and to the on-disk cache."""
     cache = _load_sweep_cache()
     cache[key] = tile
+    _SWEEP_CACHE_OWN[key] = tile
+    # Merge onto what is on disk NOW: another builder's entries survive, ours win.
+    merged: dict[str, object] = {**_read_sweep_cache_file(), **_SWEEP_CACHE_OWN}
     try:
         _SWEEP_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _SWEEP_CACHE_PATH.write_text(json.dumps(cache, indent=1), encoding="utf-8")
+        _replace_sweep_cache_file(merged)
     except OSError:
         _LOGGER.warning("could not write the tile cache at %s", _SWEEP_CACHE_PATH)
 
@@ -953,6 +1266,18 @@ def compile_cutlass_matmul(
     )
 
 
+# The rendered GEMM declares AlignmentA = AlignmentB = 8, so each operand's row must
+# be a whole number of 8-element groups. A width that is not -- the lab static net's
+# dff of 683 -- compiles, sweeps and counts as a CUTLASS node, then faults at launch
+# with CUDA_ERROR_MISALIGNED_ADDRESS (round 20, rig46 sm_120).
+CUTLASS_ALIGNMENT = 8
+
+
+def cutlass_supports(n: int, k: int) -> bool:
+    """Return whether both GEMM widths satisfy the rendered kernel's alignment."""
+    return n % CUTLASS_ALIGNMENT == 0 and k % CUTLASS_ALIGNMENT == 0
+
+
 def cutlass_matmul(
     builder: ProgramBuilder,
     kernels: KernelCache,
@@ -966,6 +1291,13 @@ def cutlass_matmul(
     alpha: Buffer | None = None,
 ) -> None:
     """Append one CUTLASS row-major dense matrix multiplication."""
+    if not cutlass_supports(specialization.n, specialization.k):
+        message = (
+            f"CUTLASS GEMM widths n={specialization.n}, k={specialization.k} are not "
+            f"multiples of the rendered alignment {CUTLASS_ALIGNMENT}; the kernel would "
+            "fault at launch with CUDA_ERROR_MISALIGNED_ADDRESS. Use matmul."
+        )
+        raise ValueError(message)
     if (bias is not None) != specialization.has_bias:
         message = "CutlassMatmulSpecialization.has_bias must match the bias argument."
         raise ValueError(message)

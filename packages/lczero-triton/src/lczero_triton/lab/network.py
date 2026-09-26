@@ -524,8 +524,14 @@ def _network(context: _Context, lab: LabNetwork) -> None:
         PrologueStaticSpecialization(batch, context.architecture),
     )
     body, _ = _embedding(context, lab, planes)
+    lowest = context.builder.priority_range[0]
+    priority_steps = lowest - context.builder.priority_range[1]
+    encoder_count = shape.blocks
     for index in range(shape.blocks):
-        _LOGGER.info("batch size %d: building encoder %d/%d", batch, index + 1, shape.blocks)
+        limit = step * encoder_count // priority_steps
+        if index >= limit:
+            context.builder.priority = context.builder.priority - 1
+        _LOGGER.info("batch size %d: building encoder %d/%d with %d priority", batch, index + 1, shape.blocks, context.builder.priority)
         body = _encoder(context, lab, body, edges, edge_norm, index)
     if lab.final_norm is not None:
         # O: the pre-norm tower is normed once, here, before every head.
@@ -535,9 +541,10 @@ def _network(context: _Context, lab: LabNetwork) -> None:
     _policy_head(context, lab, body, edges, edge_norm)
     _dense_head(context, body, "/value", hidden_width=128, square_width=128, output_name="/output/wdl",
                 output_width=3, final_activation="none")
+    context.builder.priority = context.builder.priority + 1
     _dense_head(context, body, "/moves", hidden_width=128, square_width=8, output_name="/output/mlh",
                 output_width=1, final_activation="relu")
-
+    context.builder.priority = context.builder.priority - 1
 
 def _cutlass_fits(prefix: str, out_width: int, in_width: int) -> bool:
     """Route to CUTLASS only when both widths meet its alignment of 8."""
@@ -1152,6 +1159,7 @@ def _encoder_egt(  # noqa: PLR0913
 
 def _policy_head(context: _Context, lab: LabNetwork, body: Buffer, edges: Buffer, edge_norm: Buffer) -> None:
     # `width` is the policy head's own width from here on: the trunk enters through the embedding projection only.
+    context.builder.priority = context.builder.priority - 1
     trunk = lab.architecture.d_model
     width = lab.architecture.policy_width or trunk
     batch, rows = context.batch_size, context.rows
@@ -1194,6 +1202,7 @@ def _policy_head(context: _Context, lab: LabNetwork, body: Buffer, edges: Buffer
     )
     policy_map(context.builder, context.kernels, output, records, mapping,
                PolicyMapSpecialization(batch, context.architecture))
+    context.builder.priority = context.builder.priority + 1
 
 
 def _dense_head(  # noqa: PLR0913

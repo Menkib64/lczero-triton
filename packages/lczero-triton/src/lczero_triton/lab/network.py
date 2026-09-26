@@ -1203,14 +1203,42 @@ def _policy_head(context: _Context, lab: LabNetwork, body: Buffer, edges: Buffer
         context.builder, context.kernels, records, key, context.weight("/policy/promotion/w"),
         PromotionLogitsSpecialization(batch, width, context.architecture),
     )
-    # The export's gather table equals lc0's policy map (checked 09-10), so the
-    # built-in symbol serves it and `/policy/map/w` is not uploaded.
-    mapping = context.builder.add_symbol(compile_symbol(architecture=f"sm_{context.architecture}"))
-    output = context.builder.buffer(
-        name="/output/policy", shape=(batch, 1858), dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32, writable=True,
+    mapping = context.builder.buffer(
+        name="/input/policy_mapping",
+        shape=(context.batch_size, 218),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_U32,
     )
-    policy_map(context.builder, context.kernels, output, records, mapping,
-               PolicyMapSpecialization(batch, context.architecture))
+    mapping_host = context.builder.host_buffer(
+        shape=(context.batch_size, 218),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_U32,
+    )
+    output = context.builder.buffer(
+        name="/output/policy",
+        shape=(context.batch_size, 218),
+        dtype=context.builder.io_data_type,
+        writable=True,
+    )
+    output_host = context.builder.host_buffer(
+        shape=(context.batch_size, 218),
+        dtype=context.builder.io_data_type,
+        writable=True,
+    )
+
+    context.builder.memcpy(dst=mapping, src=mapping_host)
+    output_type=context.builder.io_data_type
+    policy_map(
+        context.builder,
+        context.kernels,
+        output,
+        records,
+        mapping,
+        PolicyMapSpecialization(output_type, context.batch_size, context.architecture),
+    )
+    context.builder.memcpy(dst=output_host,src=output)
+    context.builder.event_record(
+        event="/event/policy_done",
+        buffer=[output_host],
+    )
     context.builder.priority = context.builder.priority + 1
 
 

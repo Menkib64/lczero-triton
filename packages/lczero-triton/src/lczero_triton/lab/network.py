@@ -1048,9 +1048,9 @@ def _network_egt(context: _Context, lab: LabNetwork) -> None:
                 write_copy(context.builder, context.kernels, copy, state[current], copy_specialization(written))
     _policy_head(context, lab, body, edges, edge_norm)
     _dense_head(context, body, "/value", hidden_width=128, square_width=128, output_name="/output/wdl",
-                output_width=3, final_activation="none")
+                output_width=3, final_activation="none", event="/event/wdl_done")
     _dense_head(context, body, "/moves", hidden_width=128, square_width=8, output_name="/output/mlh",
-                output_width=1, final_activation="relu")
+                output_width=1, final_activation="relu", event="/event/mlh_done")
 
 
 def _encoder_egt(  # noqa: PLR0913
@@ -1244,7 +1244,7 @@ def _policy_head(context: _Context, lab: LabNetwork, body: Buffer, edges: Buffer
 
 def _dense_head(  # noqa: PLR0913
     context: _Context, body: Buffer, prefix: str, *, hidden_width: int, square_width: int, output_name: str,
-    output_width: int, final_activation: str,
+    output_width: int, final_activation: str, event: str,
 ) -> None:
     """Per-square projection with Mish, flatten, dense with Mish, dense output."""
     width = context.plans[f"{prefix}/embedding/w"].shape[0]
@@ -1256,7 +1256,15 @@ def _dense_head(  # noqa: PLR0913
     _projection(context, hidden, embedded, f"{prefix}/dense1", batch, hidden_width, _SQUARES * square_width,
                 use_cutlass=False, activation="mish")
     output = context.builder.buffer(
-        name=output_name, shape=(batch, output_width), dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32, writable=True,
+        name=output_name,
+        shape=(context.batch_size, output_width),
+        dtype=context.builder.io_data_type,
+        writable=True,
+    )
+    output_host = context.builder.host_buffer(
+        shape=(context.batch_size, output_width),
+        dtype=context.builder.io_data_type,
+        writable=True,
     )
     # Q1: the int8 artifact's WDL layer is the analyser's D1 refit (the FP16 artifact never carries it).
     weight_name, bias_name = (D1_NAMES if context.d1 and prefix == "/value"
@@ -1264,6 +1272,11 @@ def _dense_head(  # noqa: PLR0913
     matmul(
         context.builder, context.kernels, output, hidden, context.weight(weight_name),
         MatmulSpecialization(batch, output_width, hidden_width, context.architecture, has_bias=True,
-                             activation=final_activation, output_f32=True),
+                             activation=final_activation, context.builder.io_data_type == lc0ex_pb2.Buffer.DATA_TYPE_F32),
         bias=context.weight(bias_name),
+    )
+    context.builder.memcpy(dst=output_host, src=output)
+    context.builder.event_record(
+        event=event,
+        buffer=[output_host],
     )

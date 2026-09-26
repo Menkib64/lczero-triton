@@ -478,15 +478,38 @@ def _quant_offset_norms(lab: LabNetwork) -> frozenset[str]:
                      if (vectors := loaded.get(scope, site)) is not None and vectors.offset is not None)
 
 
+def _inputs(context: _BuildContext) -> tuple[Buffer, Buffer]:
+    """Declare the packed execution inputs consumed by plane expansion."""
+    host_masks = context.builder.host_buffer(
+        shape=(context.batch_size, _INPUT_CHANNELS),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_U64,
+    )
+    host_values = context.builder.host_buffer(
+        shape=(context.batch_size, _INPUT_CHANNELS),
+        dtype=context.builder.io_data_type,
+    )
+    masks = context.builder.buffer(
+        name="/input/plane_masks",
+        shape=(context.batch_size, _INPUT_CHANNELS),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_U64,
+    )
+    values = context.builder.buffer(
+        name="/input/plane_values",
+        shape=(context.batch_size, _INPUT_CHANNELS),
+        dtype=context.builder.io_data_type,
+    )
+    context.builder.memcpy(dst=masks, src=host_masks)
+    context.builder.memcpy(dst=values, src=host_values)
+    context.builder.event_wait(
+        event="/event/compute_ordering",
+        buffer=[masks, values],
+    )
+    return masks, values
+
 def _network(context: _Context, lab: LabNetwork) -> None:
     shape = lab.architecture
     batch = context.batch_size
-    masks = context.builder.buffer(
-        name="/input/plane_masks", shape=(batch, _INPUT_CHANNELS), dtype=lc0ex_pb2.Buffer.DATA_TYPE_U64,
-    )
-    values = context.builder.buffer(
-        name="/input/plane_values", shape=(batch, _INPUT_CHANNELS), dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32,
-    )
+    masks, values = _inputs(context)
     planes = context.temporary(batch * _INPUT_CHANNELS * _SQUARES)
     expand_planes(
         context.builder, context.kernels, planes, masks, values,

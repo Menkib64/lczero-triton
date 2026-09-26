@@ -533,11 +533,20 @@ def _network(context: _Context, lab: LabNetwork) -> None:
             context.builder.priority = context.builder.priority - 1
         _LOGGER.info("batch size %d: building encoder %d/%d with %d priority", batch, index + 1, shape.blocks, context.builder.priority)
         body = _encoder(context, lab, body, edges, edge_norm, index)
+        if index + 3 == encoder_count:
+            context.builder.event_record(
+                event="/event/sleep",
+                buffer=[body],
+            )
     if lab.final_norm is not None:
         # O: the pre-norm tower is normed once, here, before every head.
         normed = context.temporary(context.rows * shape.d_model)
         _norm(context, normed, body, "/encoder/final_norm", shape.d_model, "none")
         body = normed
+    context.builder.event_record(
+        event="/event/compute_ordering",
+        buffer=[body],
+    )
     _policy_head(context, lab, body, edges, edge_norm)
     _dense_head(context, body, "/value", hidden_width=128, square_width=128, output_name="/output/wdl",
                 output_width=3, final_activation="none")

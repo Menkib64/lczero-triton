@@ -36,7 +36,7 @@ _MISH_BRANCH = tl.constexpr(-0.6)
 def apply_activation(values, activation: tl.constexpr) -> tl.tensor:
     """Apply one activation to FP32 values, matching LC0's formulas exactly."""
     if activation == _MISH:
-        exponential = tl.exp(values)
+        exponential = tl.exp(value.to(tl.float32))
         numerator = exponential * exponential + 2.0 * exponential
         division = values / (numerator + 2.0)
         values = tl.where(
@@ -45,7 +45,7 @@ def apply_activation(values, activation: tl.constexpr) -> tl.tensor:
             values - 2.0 * division,
         )
     elif activation == _SWISH:
-        values = values / (1.0 + tl.exp(-values))
+        values = values / (1.0 + tl.exp(-values.to(tl.float32))
     elif activation == _RELU:
         values = tl.maximum(values, 0.0)
     return values
@@ -169,7 +169,7 @@ def _softcap(values, cap: tl.constexpr) -> tl.tensor:
     costs **9 float ops per element** against the 14 that libdevice's `tanh`
     expands to (R86) -- measured, not assumed.
     """
-    magnitude = tl.abs(values) / cap
+    magnitude = tl.abs(values.to(tl.float32)) / cap
     decay = tl.exp(-2.0 * magnitude)
     tangent = (1.0 - decay) / (1.0 + decay)
     return cap * tl.where(values < 0.0, -tangent, tangent)
@@ -211,7 +211,7 @@ def apply_glu(
     from `apply_activation` rather than written a second time.
     """
     if gate == _GLU_SIGMOID:
-        result = (1.0 / (1.0 + tl.exp(-gate_values))) * linear_values
+        result = (1.0 / (1.0 + tl.exp(-gate_values.to(tl.float32))) * linear_values
     elif gate == _GLU_SWIGLU:
         result = apply_activation(gate_values, _SWISH) * linear_values
     elif gate == _GLU_REGLU:
@@ -220,7 +220,7 @@ def apply_glu(
         activated = apply_activation(gate_values, _SWISH)
         result = _softcap(activated, softcap) * _softcap(linear_values, softcap)
     elif gate == _GLU_SIGMOID_CAPPED:
-        activated = 1.0 / (1.0 + tl.exp(-gate_values))
+        activated = 1.0 / (1.0 + tl.exp(-gate_values.to(tl.float32)))
         result = _softcap_unit(activated, softcap) * _softcap(linear_values, softcap)
     else:
         result = gate_values * linear_values
